@@ -5,7 +5,7 @@ ipdb==0.13.13
 lovely_tensors==0.1.16
 matplotlib==3.7.1
 mitsuba==3.5.2
-numpy==2.2.4
+numpy==1.26
 open3d==0.18.0
 opencv_python==4.7.0.72
 Pillow==11.1.0
@@ -17,5 +17,3 @@ torch==2.4.1
 torchmetrics==1.4.0.post0
 torchvision==0.19.1
 tqdm==4.66.4
-wandb==0.19.9
-xformers==0.0.29.post3
