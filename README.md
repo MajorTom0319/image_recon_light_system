@@ -1,5 +1,5 @@
 # Materialist
-# [Project Page](https://lez-s.github.io/materialist_project/) | [Paper](https://arxiv.org/abs/2501.03717)
+## [Project Page](https://lez-s.github.io/materialist_project/) | [Paper (arXiv)](https://arxiv.org/abs/2501.03717) | [Paper (IJCV)](https://link.springer.com/article/10.1007/s11263-026-02833-z)
 ![teaser](assets/teaser.png)
 Materialist is an inverse rendering framework for material estimation and editing from single images. It leverages differentiable rendering techniques to accurately recover physically-based materials and lighting conditions from photographs.
 
