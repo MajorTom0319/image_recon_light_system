@@ -794,7 +794,10 @@ class MatBSDF(mi.BSDF):
 
         self.width, self.height = self.cam_meta['film.size']
 
-        fov = torch.deg2rad(torch.tensor(self.cam_meta['x_fov'][0]))
+        if props.has_property('fov'):
+            fov = torch.deg2rad(torch.tensor(float(props['fov'])))
+        else:
+            fov = torch.deg2rad(torch.tensor(self.cam_meta['x_fov'][0]))
         self.focal = 0.5*self.width/torch.tan(0.5*fov)
         self.R = to_world[:3,:3]
         nearclip = self.cam_meta['near_clip']
@@ -885,8 +888,8 @@ class MatBSDF(mi.BSDF):
         return brdf,pdf
 
     def traverse(self, callback):
-        callback.put_parameter('cam_meta', self.cam_meta, mi.ParamFlags.NonDifferentiable)
-        callback.put_parameter('mat', self.mat, mi.ParamFlags.NonDifferentiable)
+        callback.put('cam_meta', self.cam_meta, mi.ParamFlags.NonDifferentiable)
+        callback.put('mat', self.mat, mi.ParamFlags.NonDifferentiable)
         
 class RefractBaseBRDF(BaseBRDF):
     def __init__(self,ior = 1., specTrans = 0.5, use_mesh_normal = True,keep_albedo_color=False):
@@ -1235,10 +1238,10 @@ class MatDiffBSDF(mi.BSDF):
             self.use_mesh_normal = props['use_mesh_normal']
         else:
             self.use_mesh_normal = True
-        self.a = mi.TensorXf(0.5,shape=(512,512,3))
-        self.r = mi.TensorXf(0.5,shape=(512,512,1))
-        self.m = mi.TensorXf(0.5,shape=(512,512,1))
-        self.n = mi.TensorXf(0.5,shape=(512,512,3))
+        self.a = mi.TensorXf(np.full((512, 512, 3), 0.5, dtype=np.float32))
+        self.r = mi.TensorXf(np.full((512, 512, 1), 0.5, dtype=np.float32))
+        self.m = mi.TensorXf(np.full((512, 512, 1), 0.5, dtype=np.float32))
+        self.n = mi.TensorXf(np.full((512, 512, 3), 0.5, dtype=np.float32))
 
         if props.has_property('mat_dir'):
             self.mat = load_estimated_brdf(props['mat_dir'])
@@ -1265,7 +1268,10 @@ class MatDiffBSDF(mi.BSDF):
 
         self.width, self.height = self.cam_meta['film.size']
 
-        fov = torch.deg2rad(torch.tensor(self.cam_meta['x_fov'][0]))
+        if props.has_property('fov'):
+            fov = torch.deg2rad(torch.tensor(float(props['fov'])))
+        else:
+            fov = torch.deg2rad(torch.tensor(self.cam_meta['x_fov'][0]))
         self.focal = 0.5*self.width/torch.tan(0.5*fov)
         self.R = to_world[:3,:3]
         nearclip = self.cam_meta['near_clip']
@@ -1462,11 +1468,11 @@ class MatDiffBSDF(mi.BSDF):
     def to_string(self):
         return 'MatDiffBSDF'
     def traverse(self, callback):
-        callback.put_parameter('a', self.a, mi.ParamFlags.Differentiable)
-        callback.put_parameter('r', self.r, mi.ParamFlags.Differentiable)
-        callback.put_parameter('m', self.m, mi.ParamFlags.Differentiable)
-        callback.put_parameter('n', self.n, mi.ParamFlags.Differentiable)
-        callback.put_parameter('use_mesh_normal', self.use_mesh_normal, mi.ParamFlags.NonDifferentiable)
+        callback.put('a', self.a, mi.ParamFlags.Differentiable)
+        callback.put('r', self.r, mi.ParamFlags.Differentiable)
+        callback.put('m', self.m, mi.ParamFlags.Differentiable)
+        callback.put('n', self.n, mi.ParamFlags.Differentiable)
+        callback.put('use_mesh_normal', self.use_mesh_normal, mi.ParamFlags.NonDifferentiable)
 
     def parameters_changed(self, keys):
         # print(self.mat_nn)
@@ -1488,8 +1494,8 @@ class TransBSDF(MatDiffBSDF):
             self.keep_albedo_color = False
             self.refract_distance = 1.0 
         self.specTrans = mi.Float(0.8)
-        self.bg = mi.TensorXf(0.5,shape=(512,512,3))
-        self.mask = mi.TensorXf(0,shape=(512,512)) > 0
+        self.bg = mi.TensorXf(np.full((512, 512, 3), 0.5, dtype=np.float32))
+        self.mask = mi.TensorXf(np.zeros((512, 512), dtype=np.float32)) > 0
 
     def calculate_refraction(self, wi, normal, ior_ratio):
         cos_theta_i = dr.dot(wi, normal)
@@ -1709,10 +1715,12 @@ class TransBSDF(MatDiffBSDF):
         F_glass = 0.5 * (R_s**2 + R_p**2) # ior up, F_glass up
         D_hacking = D_GGX(NoH, roughness*0+1) 
         # try to make the rays not specular reflect when transmit by hacking the roughness
-        btdf_glass = (baseColor_glass)**0.5 * G * D_hacking * (1 - F_glass) * (self.ior**2 * hw_in * hw_out) / (nw_in * nw_out * (self.ior * hw_in + hw_out)**2)
-        brdf_spec_edit = baseColor_glass * D * G / (4 * nw_in) 
+        btdf_glass =  (baseColor_glass)**0.5 * G * D_hacking * (1-F_glass) * (hw_out * hw_in)/(nw_in*(hw_in+self.ior*hw_out)**2)
+        brdf_spec_edit = 4 * baseColor_glass * D * G/ (4 * nw_in * dr.maximum(NoV, 1e-6))
+
         # brdf_spec_edit = 0
         f_glass = dr.select(glass_mask, brdf_spec_edit, btdf_glass)
+        
         bsdf_edit = brdf_diff + brdf_metal + f_glass
 
         bsdf_edit[~mask] = 0
@@ -1761,13 +1769,13 @@ class TransBSDF(MatDiffBSDF):
         return brdf,pdf
     
     def traverse(self, callback):
-        callback.put_parameter('a', self.a, mi.ParamFlags.Differentiable)
-        callback.put_parameter('r', self.r, mi.ParamFlags.Differentiable)
-        callback.put_parameter('m', self.m, mi.ParamFlags.Differentiable)
-        callback.put_parameter('bg', self.bg, mi.ParamFlags.Differentiable)
-        callback.put_parameter('mask', self.mask, mi.ParamFlags.Differentiable)
-        callback.put_parameter('specTrans', self.specTrans, mi.ParamFlags.Differentiable)
-        callback.put_parameter('ior', self.ior, mi.ParamFlags.Differentiable)
+        callback.put('a', self.a, mi.ParamFlags.Differentiable)
+        callback.put('r', self.r, mi.ParamFlags.Differentiable)
+        callback.put('m', self.m, mi.ParamFlags.Differentiable)
+        callback.put('bg', self.bg, mi.ParamFlags.Differentiable)
+        callback.put('mask', self.mask, mi.ParamFlags.Differentiable)
+        callback.put('specTrans', self.specTrans, mi.ParamFlags.Differentiable)
+        callback.put('ior', self.ior, mi.ParamFlags.Differentiable)
 
 
 class BRDF4scratch(BaseBRDF):

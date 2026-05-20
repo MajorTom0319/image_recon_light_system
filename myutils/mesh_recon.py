@@ -14,15 +14,28 @@ import torch
 # from transformers import pipeline,AutoImageProcessor, AutoModelForDepthEstimation
 from PIL import Image
 from skimage.transform import resize
-fov = np.deg2rad(35)
-focal = (512/2)/math.tan(fov/2)
-wh = 512
-center_ = (wh-1)/2
-DEFAULT_CAMERA = o3d.camera.PinholeCameraIntrinsic(
-    width=wh, height=wh,
-    fx=focal, fy=focal,
-    cx=center_, cy=center_
-)
+
+DEFAULT_FOV_DEG = 35.0
+DEFAULT_WH = 512
+
+
+def _compute_intrinsic(fov_deg, width, height):
+    fov_rad = np.deg2rad(fov_deg)
+    focal = (width / 2) / math.tan(fov_rad / 2)
+    center_ = (width - 1) / 2
+    return focal, center_
+
+
+def set_recon_camera(fov_deg=DEFAULT_FOV_DEG, width=DEFAULT_WH, height=DEFAULT_WH):
+    global DEFAULT_CAMERA
+    focal, center_ = _compute_intrinsic(fov_deg, width, height)
+    DEFAULT_CAMERA = o3d.camera.PinholeCameraIntrinsic(
+        width=width, height=height, fx=focal, fy=focal, cx=center_, cy=center_
+    )
+    return DEFAULT_CAMERA
+
+
+DEFAULT_CAMERA = set_recon_camera()
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +77,8 @@ def depth_file_to_mesh(image, cameraMatrix=DEFAULT_CAMERA, minAngle=3.0, sun3d=F
 
     if cameraMatrix is None:
         camera = DEFAULT_CAMERA
+    elif type(cameraMatrix) == o3d.camera.PinholeCameraIntrinsic:
+        camera = cameraMatrix
     else:
         camera = o3d.camera.PinholeCameraIntrinsic(
             width=width, height=height,
@@ -313,19 +328,19 @@ def detect_boundary_points(depth, camera=DEFAULT_CAMERA, minAngle=3.0):
     # copy_depth = np.array(copy_depth)
     # copy_coords = K_inv @ np.array(copy_verts).T * copy_depth.flatten()
 
-    new_cam_coords = np.hstack((new_cam_coords, np.array(copy_coords).T))
+    if len(copy_coords) > 0:
+        new_cam_coords = np.hstack((new_cam_coords, np.array(copy_coords).T))
 
     points = o3d.utility.Vector3dVector(new_cam_coords.transpose())
     try:
         boundary_points = o3d.utility.Vector3dVector(np.array(boundary_points))
+        boundary_points = o3d.geometry.PointCloud(boundary_points)
+        copy_points = o3d.utility.Vector3dVector(np.array(copy_coords))
+        copy_points = o3d.geometry.PointCloud(copy_points)
     except:
-        breakpoint()
+        boundary_points = o3d.geometry.PointCloud()
+        copy_points = o3d.geometry.PointCloud()
 
-    boundary_points = o3d.geometry.PointCloud(boundary_points)
-
-    copy_points = o3d.utility.Vector3dVector(np.array(copy_coords))
-
-    copy_points = o3d.geometry.PointCloud(copy_points)
 
     mesh = o3d.geometry.TriangleMesh(points, indices)
     return mesh, copy_points

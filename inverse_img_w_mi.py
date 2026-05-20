@@ -106,7 +106,8 @@ def get_output_dir(save_name, save_path=None):
 def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
                     output_type,optimize_order,spp=64,use_gt_scene = False,
                     model_name='pos_mlp',opt_env_from=0,
-                    opt_src='arm',use_mask=False,scale_delta=0.1, save_path=None):
+                    opt_src='arm',use_mask=False,scale_delta=0.1, save_path=None,
+                    env_coordinate_type='spherical'):
     '''
     mat: dict, albedo:H,W,C, roughness:H,W,1, metallic:H,W,1, normal:H,W,3, depth:H,W,1, gt_image:H,W,3
     '''
@@ -114,13 +115,19 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
     depth = 4
     width = 256
     weight_norm = False
-    envmap_net = PosMLP(in_dims=5,
+    env_h, env_w = 16, 32
+    env_input_dims = 6 if env_coordinate_type == 'spherical' else 5
+    envmap_net = PosMLP(in_dims=env_input_dims,
                             out_dims=3,
                             dims=[width] * depth,
                             skip_connection=[1,3],
                             weight_norm=weight_norm,
                             multires_view = 2,
-                            output_type='envmap',color_ch=3)
+                            output_type='envmap',
+                            color_ch=3,
+                            img_h=env_h,
+                            img_w=env_w,
+                            coordinate_type=env_coordinate_type)
     envmap_net = envmap_net.cuda()
     # opt_env = torch.optim.Adam(envmap_net.parameters(), lr=1e-4)
     
@@ -176,7 +183,6 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
     if use_gt_scene:
         gt_envmap = mat['gt_envmap']
 
-    env_h, env_w = 16, 32
     start_envmap = torch.ones(env_h, env_w, 3, device=device)
     start_envmap = start_envmap.reshape(-1, 3)
     
@@ -620,7 +626,8 @@ def countdown(seconds):
         seconds -= 1
     print('00:00')
 
-def inverse_image(img_inverse_path, save_name, opt_src, opt_order, use_mask, opt_env_from, save_path=None):
+def inverse_image(img_inverse_path, save_name, opt_src, opt_order, use_mask, opt_env_from,
+                  save_path=None, env_coordinate_type='spherical'):
     print(f'Inverse image {img_inverse_path}')
     spp=64
     use_sh = False
@@ -683,6 +690,7 @@ def inverse_image(img_inverse_path, save_name, opt_src, opt_order, use_mask, opt
             'opt_order': opt_order,
             'use_mask': use_mask,
             'opt_env_from': opt_env_from,
+            'env_coordinate_type': env_coordinate_type,
             'model_name': model_name,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -767,7 +775,8 @@ def inverse_image(img_inverse_path, save_name, opt_src, opt_order, use_mask, opt
                     opt_env_from=opt_env_from,
                     opt_src=opt_src,
                     use_mask=use_mask,
-                    save_path=save_path)
+                    save_path=save_path,
+                    env_coordinate_type=env_coordinate_type)
 def parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -779,6 +788,9 @@ def parse_args():
     parser.add_argument('--use_mask',required=False,action='store_true',help='use mask')
     parser.add_argument('--opt_env_from', required=False,default=0,type=int,help='start env opt from n-th round')
     parser.add_argument('--save_path', required=False, default=None, type=str, help='path to save results')
+    parser.add_argument('--env_coordinate_type', required=False, default='spherical',
+                        choices=['spherical', 'uv'],
+                        help='coordinate parameterization for the optimized environment map MLP')
     parser.add_argument('--model_name', required=False, default='pos_mlp', type=str, choices=['pos_mlp', 'none'], 
                         help='model to use for optimization (pos_mlp or none)')
     return parser.parse_args()
@@ -794,7 +806,8 @@ def inverse_real(args):
     inverse_image(img_path, save_name, opt_src, opt_order, 
                  use_mask=args.use_mask, 
                  opt_env_from=args.opt_env_from,
-                 save_path=save_path)
+                 save_path=save_path,
+                 env_coordinate_type=args.env_coordinate_type)
 
 
 if __name__ == '__main__':

@@ -351,7 +351,7 @@ def render_rolling_envmap(save_name, env_path, frames, rotation_step, edit={'alb
             use_mesh_normal = True
             print('Use Mesh Normal')
         
-        scene = load_estimated_mesh_w_env(mesh_path, temp_env_path, use_mesh_normal=use_mesh_normal, bsdf={'name':'lezDiffBSDF'})
+        scene = load_estimated_mesh_w_env(mesh_path, temp_env_path, use_mesh_normal=use_mesh_normal, bsdf={'name':'matDiffBSDF'})
         
         empty_img = np.zeros((512,512,3), dtype=np.float32)
         denoiser = mi.OptixDenoiser(input_size=empty_img.shape[:2], albedo=False, normals=False, temporal=False)
@@ -445,5 +445,16 @@ if __name__ == "__main__":
         render_real(save_name, env_path, edit=edit, n_iter=n_iter, input_path=input_path, save_path=save_path)
     elif mode == 'oi':
         render_io(save_name, env_path, input_path=input_path, save_path=save_path)
+    elif mode == 'rolling':
+        render_rolling_envmap(
+            save_name,
+            env_path,
+            frames=args.frames,
+            rotation_step=args.rotation_step,
+            edit=edit,
+            n_iter=1,
+            input_path=input_path,
+            save_path=save_path,
+        )
     else:
         raise ValueError("Invalid mode")

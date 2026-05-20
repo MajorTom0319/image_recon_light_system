@@ -23,8 +23,8 @@ def transprancy_edit(mesh_path,env_path,save_name,ior,keep_albedo_color,specTran
     roughness = mat['roughness']
     metallic = mat['metallic']
     if not keep_albedo_color:
-        albedo[mask] = 0.7
-    roughness[mask] = roughness[mask] * 0 + 0.3
+        albedo[mask] = 0.4
+    roughness[mask] = roughness[mask] * 0 + 0.4
     metallic[mask] = metallic[mask] * 0.
     mi_params = mi.traverse(scene)
     mi_params['shape.bsdf.a'] = albedo
@@ -36,7 +36,7 @@ def transprancy_edit(mesh_path,env_path,save_name,ior,keep_albedo_color,specTran
     mi_params['shape.bsdf.specTrans'] = specTrans
     mi_params['shape.bsdf.ior'] = ior
     mi_params.update()
-    empty_img = mi.TensorXf(0.0,shape=(512,512,3))
+    empty_img = mi.TensorXf(np.zeros((512, 512, 3), dtype=np.float32))
     for i in tqdm(range(n_iter)):
         img = mi.render(scene,spp=64,seed=i)
         empty_img += img

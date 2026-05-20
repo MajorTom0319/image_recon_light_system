@@ -1,0 +1,11 @@
+{
+  "image_path": "/home/lez/Documents/inverse-mat-est-edit/Materialist/examples/infer_envmap/example_img.exr",
+  "output_dir": "/home/lez/Documents/inverse-mat-est-edit/Materialist/examples/infer_envmap",
+  "mesh_path": "/home/lez/Documents/inverse-mat-est-edit/Materialist/examples/infer_envmap/example_img.ply",
+  "coordinate_type": "spherical",
+  "env_h": 64,
+  "env_w": 128,
+  "spp": 64,
+  "epochs": 500,
+  "timestamp": "2026-05-20 14:12:01"
+}

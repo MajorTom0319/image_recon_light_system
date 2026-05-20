@@ -135,9 +135,16 @@ class PosMLP(BaseBRDF):
                  skip_connection=(),
                  weight_norm=True,
                  multires_view=0,
-                 output_type='envmap',color_ch = 5):
+                 output_type='envmap',
+                 color_ch=5,
+                 img_h=None,
+                 img_w=None,
+                 coordinate_type='uv'):
         super().__init__()
         self.init_range = np.sqrt(3 / dims[0])
+        self.img_h = img_h
+        self.img_w = img_w
+        self.coordinate_type = coordinate_type
 
         dims = [in_dims] + dims + [out_dims]
         first_omega = 1
@@ -147,12 +154,10 @@ class PosMLP(BaseBRDF):
         self.embedview_fn = lambda x: x
 
         if multires_view > 0:
-            # breakpoint()
-            embedview_fn, input_ch = get_embedder(multires_view, input_dims=2) #x,y
+            embed_dims = 3 if coordinate_type == 'spherical' else 2
+            embedview_fn, input_ch = get_embedder(multires_view, input_dims=embed_dims)
             self.embedview_fn = embedview_fn
-            # breakpoint()
             dims[0] += (input_ch - in_dims) + color_ch
-        # breakpoint()
         self.num_layers = len(dims)
         self.skip_connection = skip_connection
 
@@ -188,23 +193,42 @@ class PosMLP(BaseBRDF):
         pass
 
     def img2points(self, img):
-        # img 1,h*w,5
-        if img.shape[0]> 512:
-            h = w = img.shape[0]**0.5
+        # img: N, C where N is either a square texture or a 2:1 envmap.
+        if self.img_h is not None and self.img_w is not None:
+            h = int(self.img_h)
+            w = int(self.img_w)
+        elif img.shape[0] > 512:
+            h = int(img.shape[0] ** 0.5)
+            w = h
         else:
-            h = (img.shape[0]/2)**0.5
-            if not h.is_integer():
+            h_float = (img.shape[0] / 2) ** 0.5
+            if not h_float.is_integer():
                 raise ValueError('width should be double of height')
-            w = h*2
-        x_coords, y_coords = torch.meshgrid(torch.arange(h), torch.arange(w),indexing='ij')
+            h = int(h_float)
+            w = h * 2
+        x_coords, y_coords = torch.meshgrid(
+            torch.arange(h, device=img.device),
+            torch.arange(w, device=img.device),
+            indexing='ij'
+        )
 
         x_coords = x_coords.flatten()
         y_coords = y_coords.flatten()
 
-        points = torch.stack([x_coords, y_coords], dim=1).to(img.device)
+        if self.coordinate_type == 'spherical':
+            u = (y_coords.float() + 0.5) / w
+            v = (x_coords.float() + 0.5) / h
+            theta = v * np.pi
+            phi = u * 2 * np.pi
+            sin_theta = torch.sin(theta)
+            points = torch.stack([
+                sin_theta * torch.cos(phi),
+                sin_theta * torch.sin(phi),
+                torch.cos(theta),
+            ], dim=1)
+        else:
+            points = torch.stack([x_coords, y_coords], dim=1).float()
         embed_points = self.embedview_fn(points)
-        # if embed_points.shape[-1] >2:
-        #     breakpoint()
         points_w_color = torch.cat([embed_points, img], dim=1)
         return points_w_color
 

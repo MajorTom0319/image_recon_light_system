@@ -11,6 +11,7 @@ Materialist is an inverse rendering framework for material estimation and editin
 - Material editing capabilities
 - Specialized rendering for transparent and translucent materials
 
+⚠️ Note: transparency editing in this repository is an approximation. The edited light paths do NOT truly pass through the object, so refraction can be inaccurate under strong or weak illumination and for geometrically complex objects.
 
 
 # Usage
@@ -49,6 +50,7 @@ You can specify which example to process by entering the corresponding number wh
 - `--opt_order`: Optimization order for material parameters (e.g., "rm a" for roughness+metallic then albedo)
 - `--use_mask`: Use mask during optimization, this is used for material editing purposes
 - `--opt_env_from`: start environment map optimization from this iteration.
+- `--env_coordinate_type`: Environment-map MLP coordinates, either `spherical` (default) or `uv`.
 
 #### 3.1.1 Settings for Synthetic images
 ```
@@ -65,8 +67,29 @@ if above settings do not yield good results, try optimize without using network,
 python inverse_img_w_mi.py --model_name=none --opt_src=a --opt_env_from=2 --opt_order=rm a
 ```
 
+## 3.2 Ablation Scripts and Examples
 
-### 3.2 Rendering and Editing
+The ablation scripts are provided under `scripts/`. Each command below
+uses a small example included in this repository and writes results to
+`examples/` by default so the outputs can be checked in place.
+
+```bash
+# Boundary duplication ablation from an example depth map
+python scripts/bd_ablation_recon.py --mode both --radii 0.030 --min_angles 0.5 --spp 64
+
+# FOV ablation using the bundled jinjya inverse-rendering output
+python scripts/fov_ablation.py --mode jinjya --pct 1.0 --frames 1 --rotation_step 0
+
+# Environment map inference: predict G-buffer with MatNet then infer envmap (fix the G-buffer during envmap optimization)
+python scripts/infer_envmap.py --image_path examples/infer_envmap/example_img.exr --epochs 500 --env_h 64 --env_w 128
+
+# Approximate transparency edit using jug, envmap57, and inpainted background
+python scripts/edit_trans_ablation.py --ior 1.1
+```
+
+
+
+### 3.3 Rendering and Editing
 ```bash
 # Render with default settings using example
 python render_final.py --save_name="indoor" --mode="real"
@@ -75,7 +98,7 @@ python render_final.py --save_name="indoor" --mode="real"
 python trans_edit.py --save_name="indoor" 
 
 # Render with shadow effects using rolling envmap
-python render_final.py --save_name="jinjya" --mode='rolling' --env_path='envmap/41.hdr'
+python render_final.py --save_name="jinjya" --mode='rolling' --env_path='envmaps/41.hdr'
 ```
 
 - `--env_path`: Path to environment map (HDR)
@@ -95,14 +118,15 @@ Results are saved to the `output_imgs/{save_name}/` directory, including:
 
 # Citation
 ```
-@misc{wang2025materialistphysicallybasedediting,
-      title={Materialist: Physically Based Editing Using Single-Image Inverse Rendering}, 
-      author={Lezhong Wang and Duc Minh Tran and Ruiqi Cui and Thomson TG and Anders Bjorholm Dahl and Siavash Arjomand Bigdeli and Jeppe Revall Frisvad and Manmohan Chandraker},
-      year={2025},
-      eprint={2501.03717},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2501.03717}, 
+@article{wang2026materialist,
+  title={Materialist: Physically Based Editing Using Single-Image Inverse Rendering},
+  author={Wang, Lezhong and Tran, Duc Minh and Cui, Ruiqi and TG, Thomson and Dahl, Anders Bjorholm and Bigdeli, Siavash Arjomand and Frisvad, Jeppe Revall and Chandraker, Manmohan},
+  journal={International Journal of Computer Vision},
+  volume={134},
+  number={6},
+  pages={267},
+  year={2026},
+  publisher={Springer}
 }
 ```
 
