@@ -115,15 +115,30 @@ def detect_boundary_points(depth, camera=DEFAULT_CAMERA, minAngle=3.0):
     w = camera.width
     h = camera.height
 
-    refer_map_x = np.ones((w, h)).astype("int")
-    refer_map_y = np.ones((w, h)).astype("int")
+    # refer_map_x = np.ones((w, h)).astype("int")
+    # refer_map_y = np.ones((w, h)).astype("int")
+    refer_map_x = np.full(
+        (h, w),
+        -1,
+        dtype=np.int32,
+    )
+    refer_map_y = np.full(
+        (h, w),
+        -1,
+        dtype=np.int32,
+    )
     refer_map_x *= -1
     refer_map_y *= -1
     cam_coords = K_inv @ pixel_coords * depth.flatten()
     boundary_points = []
     copy_coords = []
-    copy_map = np.ones((w, h)).astype("int")
-    copy_map *= -1
+    # copy_map = np.ones((w, h)).astype("int")
+    # copy_map *= -1
+    copy_map = np.full(
+        (w, h),
+        -1,
+        dtype=np.int32,
+    )
     
     with tqdm(total=(h - 1) * (w - 1),file=sys.stdout) as pbar:
         for i in range(1, h - 1):

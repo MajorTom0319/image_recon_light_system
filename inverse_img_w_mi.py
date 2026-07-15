@@ -3,6 +3,14 @@ import drjit as dr
 from myutils.mi_plugin import MatDiffBSDF
 from huggingface_hub import hf_hub_download
 from Material_net.dpt import MaterialNet
+from myutils.camera_utils import (
+    attach_infer_image_scaled,
+    estimate_camera_geocalib,
+    make_fixed35_camera,
+    make_mitsuba_compatible_K,
+    scale_intrinsics,
+    write_materialist_camera_json,
+)
 mi.register_bsdf('MatDiffBSDF', lambda props: MatDiffBSDF(props))
 import global_config
 from torchvision.utils import save_image,make_grid
@@ -24,35 +32,56 @@ import sys
 import time
 import imageio
 import os
+import cv2
+
+attach_infer_image_scaled(MaterialNet)
 
 # from render_final import load_estimated_mesh_w_env
 
-def load_estimated_mesh(mesh_path,use_mesh_normal,max_path=4):
-    camera_cfg = {"type": "perspective",
-                "fov":35,
-                "to_world": mi.ScalarTransform4f.look_at(
-                        origin=[0, 0, 0], target=[0, 0, -1], up=[0, 1, 0]),
-                "film": {
-                "type": "hdrfilm",
-                "width": 512,  # Viewport width in pixels
-                "height": 512,  # Viewport height in pixels
-                }}
+def load_estimated_mesh(mesh_path, use_mesh_normal, cam_meta_path, max_path=4):
+    """Load the reconstructed mesh with per-image intrinsics and fixed pose."""
+    with open(cam_meta_path, "r", encoding="utf-8") as file:
+        camera_meta = json.load(file)
+
+    width, height = [int(v) for v in camera_meta["film.size"]]
+    vfov_deg = float(camera_meta["y_fov"][0])
+
+    camera_cfg = {
+        "type": "perspective",
+        "fov": vfov_deg,
+        "fov_axis": "y",
+        "near_clip": float(camera_meta.get("near_clip", 0.01)),
+        "far_clip": float(camera_meta.get("far_clip", 10000.0)),
+        # Keep Materialist's original camera pose. GeoCalib roll/pitch are ignored.
+        "to_world": mi.ScalarTransform4f.look_at(
+            origin=[0, 0, 0],
+            target=[0, 0, -1],
+            up=[0, 1, 0],
+        ),
+        "film": {
+            "type": "hdrfilm",
+            "width": width,
+            "height": height,
+            "pixel_format": "rgb",
+        },
+    }
+
     camera = mi.load_dict(camera_cfg)
-    cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
     scene = mi.load_dict({
-            'type': 'scene',
-            'shape':{
-                'type': 'ply',
-                'filename': mesh_path,
-                'bsdf': {'type': 'MatDiffBSDF','cam_meta':cam_cfg_path,'use_mesh_normal':use_mesh_normal},
+        "type": "scene",
+        "shape": {
+            "type": "ply",
+            "filename": mesh_path,
+            "bsdf": {
+                "type": "MatDiffBSDF",
+                "cam_meta": str(cam_meta_path),
+                "use_mesh_normal": use_mesh_normal,
             },
-            'integrator': {
-                'type': 'path',
-                'max_depth': max_path,
-            },
-            'sensor': camera,
-            'emitter': {'type': 'envmap','filename':'envmaps/0.hdr'}
-        })
+        },
+        "integrator": {"type": "path", "max_depth": max_path},
+        "sensor": camera,
+        "emitter": {"type": "envmap", "filename": "envmaps/0.hdr"},
+    })
     return scene
 
 
@@ -159,6 +188,9 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
         normal_net = normal_net.cuda()
         opt_normal_net = torch.optim.Adam(normal_net.parameters(), lr=1e-12)
 
+    gt_image = mat['gt_image']
+    img_h, img_w = int(gt_image.shape[0]), int(gt_image.shape[1])
+
     # brdf net
 
     if model_name == 'unet':
@@ -167,19 +199,16 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
         if output_type == 'arm':
             multires_view = 2 # for pos embedding
             color_ch = 5
-            brdf_net = PosMLP(in_dims=7,out_dims=color_ch,dims=[width] * depth,skip_connection=[1,3],weight_norm=weight_norm,multires_view=multires_view,output_type=output_type,color_ch = color_ch)
+            brdf_net = PosMLP(in_dims=7,out_dims=color_ch,dims=[width] * depth,skip_connection=[1,3],weight_norm=weight_norm,multires_view=multires_view,output_type=output_type,color_ch = color_ch,img_h=img_h,img_w=img_w)
             brdf_net = brdf_net.cuda()
             # opt_brdf = torch.optim.Adam(brdf_net.parameters(), lr=1e-4)
             
         elif output_type == 'armn':
             multires_view = 0
             color_ch = 8
-            brdf_net = PosMLP(in_dims=10,out_dims=color_ch,dims=[width] * depth,skip_connection=[1,3],weight_norm=weight_norm,multires_view=multires_view,output_type=output_type,color_ch = color_ch)
+            brdf_net = PosMLP(in_dims=10,out_dims=color_ch,dims=[width] * depth,skip_connection=[1,3],weight_norm=weight_norm,multires_view=multires_view,output_type=output_type,color_ch = color_ch,img_h=img_h,img_w=img_w)
             brdf_net = brdf_net.cuda()
             # opt_brdf = torch.optim.Adam(brdf_net.parameters(), lr=1e-4)
-
-
-    gt_image = mat['gt_image']
     if use_gt_scene:
         gt_envmap = mat['gt_envmap']
 
@@ -503,13 +532,13 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
                             if output_type == 'armn':
                                 normal = NF.normalize(arm_pred[...,5:8],p=2, dim=1)
                             if 'a' in optimize_part:
-                                mat['albedo'] = albedo.reshape(512,512,3)
+                                mat['albedo'] = albedo.reshape(img_h, img_w, 3)
                             if 'r' in optimize_part:
-                                mat['roughness'] = roughness.reshape(512,512,1)
+                                mat['roughness'] = roughness.reshape(img_h, img_w, 1)
                             if 'm' in optimize_part:
-                                mat['metallic'] = metallic.reshape(512,512,1)
+                                mat['metallic'] = metallic.reshape(img_h, img_w, 1)
                             if 'n' in optimize_part:
-                                mat['normal'] = normal.reshape(512,512,3)
+                                mat['normal'] = normal.reshape(img_h, img_w, 3)
                         else:
                             raise ValueError('model_name should be unet or mlp or pos_mlp')
                         if use_mask:
@@ -527,19 +556,19 @@ def optimize_envmap_ARMN(scene,cam_cfg,mat,save_folder,use_mesh_normal,
                         loss_mse = NF.mse_loss(pred_image_srgb, gt_image_srgb)
                         loss_l1 = NF.l1_loss(pred_image_srgb, gt_image_srgb)
                         if 'a' in optimize_part:
-                            loss_a = NF.l1_loss(albedo.reshape(512,512,3), albedo_ori)
+                            loss_a = NF.l1_loss(albedo.reshape(img_h, img_w, 3), albedo_ori)
                         else:
                             loss_a = 0
                         if 'r' in optimize_part:
-                            loss_r = NF.l1_loss(roughness.reshape(512,512,1), roughness_ori)
+                            loss_r = NF.l1_loss(roughness.reshape(img_h, img_w, 1), roughness_ori)
                         else:
                             loss_r = 0
                         if 'm' in optimize_part:
-                            loss_m = NF.l1_loss(metallic.reshape(512,512,1), metallic_ori)
+                            loss_m = NF.l1_loss(metallic.reshape(img_h, img_w, 1), metallic_ori)
                         else:
                             loss_m = 0
                         if 'n' in optimize_part:
-                            loss_n = NF.l1_loss(normal.reshape(512,512,3), normal_ori)
+                            loss_n = NF.l1_loss(normal.reshape(img_h, img_w, 3), normal_ori)
                         else:
                             loss_n = 0
                         scale_raito = loss_l1.detach()/loss_mse.detach()
@@ -626,188 +655,349 @@ def countdown(seconds):
         seconds -= 1
     print('00:00')
 
-def inverse_image(img_inverse_path, save_name, opt_src, opt_order, use_mask, opt_env_from,
-                  save_path=None, env_coordinate_type='spherical'):
-    print(f'Inverse image {img_inverse_path}')
-    spp=64
+def inverse_image(
+    img_inverse_path,
+    save_name,
+    opt_src,
+    opt_order,
+    use_mask,
+    opt_env_from,
+    save_path=None,
+    env_coordinate_type="spherical",
+    model_name="pos_mlp",
+    work_scale=0.5,
+    camera_source="geocalib",
+    rebuild_mesh=False,
+):
+    print(f"Inverse image: {img_inverse_path}")
+    spp = 64
     use_sh = False
-    camera = json.load(
-            open(os.path.join(global_config.BASE_DIR, 'myutils','default_cam.json')))
-    c2w = torch.FloatTensor(camera['to_world'])[0][:3, :]
-    cam_cfg = {'to_world': c2w, 'fov': camera['x_fov'][0]}
-    model_name = 'pos_mlp'
-    
-    # Get output directory
+
     output_dir = get_output_dir(save_name, save_path)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "best_results"), exist_ok=True)
+
+    # Read the complete image. No square crop is applied.
+    # raw_image = np.array(mi.Bitmap(img_inverse_path), dtype=np.float32)
+    # if raw_image.ndim == 2:
+    #     raw_image = np.repeat(raw_image[..., None], 3, axis=-1)
+    # if raw_image.shape[-1] > 3:
+    #     raw_image = raw_image[..., :3]
+    # original_h, original_w = raw_image.shape[:2]
+
+    # if not img_inverse_path.lower().endswith(".exr"):
+    #     warnings.warn(
+    #         "The input image is PNG/JPG; treating it as sRGB and converting to linear.",
+    #         UserWarning,
+    #     )
+    #     raw_image = srgb_to_linear(raw_image)
+    image_bgr = cv2.imread(
+        img_inverse_path,
+        cv2.IMREAD_UNCHANGED,
+    )
+    if image_bgr is None:
+        raise FileNotFoundError(img_inverse_path)
+
+    if image_bgr.ndim == 2:
+        image_bgr = cv2.cvtColor(
+            image_bgr,
+            cv2.COLOR_GRAY2BGR,
+        )
+
+    if image_bgr.shape[2] == 4:
+        image_bgr = image_bgr[:, :, :3]
+
+    raw_image = cv2.cvtColor(
+        image_bgr,
+        cv2.COLOR_BGR2RGB,
+    )
+
+    original_h, original_w = raw_image.shape[:2]
     
-    # Ensure output directories exist
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        os.makedirs(os.path.join(output_dir, 'best_results'))
-    
-    img_inverse = mi.Bitmap(img_inverse_path)
-    img_inverse = center_crop_and_resize(np.array(img_inverse), (512, 512), return_tensor=False)
-    if not img_inverse_path.endswith('.exr'):
-        warnings.warn('The input image is in PNG/JPG format, assume it is sRGB, will convert to linear', UserWarning)
-        img_inverse = srgb_to_linear(img_inverse)
-    
-    if opt_src != 'skip' or opt_order != ['skip']:
+    if not np.isfinite(work_scale) or work_scale <= 0:
+        raise ValueError("work_scale must be a finite positive number")
+
+    # GeoCalib sees the original file and supplies focal length only.
+    if camera_source == "geocalib":
+        geo_camera = estimate_camera_geocalib(img_inverse_path, device="cuda")
+        if (geo_camera.height, geo_camera.width) != (original_h, original_w):
+            raise RuntimeError(
+                "GeoCalib and Materialist read different image sizes: "
+                f"GeoCalib={geo_camera.width}x{geo_camera.height}, "
+                f"Materialist={original_w}x{original_h}"
+            )
+    elif camera_source == "fixed35":
+        geo_camera = make_fixed35_camera(original_w, original_h)
+    else:
+        raise ValueError(f"Unknown camera_source: {camera_source}")
+
+    pred_mat = None
+    preprocess_meta = None
+    if opt_src != "skip" or opt_order != ["skip"]:
         model_path = hf_hub_download(
             repo_id="Lez/MatNet",
             filename="matnet_weights.pth",
-            repo_type="model"
+            repo_type="model",
         )
-        matnet = MaterialNet(encoder='vitb', features=128, out_channels=[96, 192, 384, 768], use_bn=False, use_clstoken=False)
+        matnet = MaterialNet(
+            encoder="vitb",
+            features=128,
+            out_channels=[96, 192, 384, 768],
+            use_bn=False,
+            use_clstoken=False,
+        )
         matnet.load_state_dict(torch.load(model_path, weights_only=True))
-        matnet = matnet.cuda()
-        pred_mat = matnet.infer_image(img_inverse)
-        albedo = pred_mat['albedo']
-        normal = pred_mat['normal']
-        roughness = pred_mat['roughness'] 
-        metallic = pred_mat['metallic'] 
-        depth = pred_mat['depth']
-
-        mat = {}
-        
-        mat['gt_image'] = torch.from_numpy(img_inverse).cuda()
-        mat['albedo'] = torch.from_numpy(albedo).cuda().clamp(0,1)
-        mat['normal'] = torch.from_numpy(normal).cuda()
-        mat['roughness'] = torch.from_numpy(roughness).unsqueeze(-1).cuda().clamp(0.07,1)
-        mat['metallic'] = torch.from_numpy(metallic).unsqueeze(-1).cuda().clamp(0,1)
-        mat['depth'] = torch.from_numpy(depth).unsqueeze(-1).cuda()
-
-        mi.util.write_bitmap(os.path.join(output_dir,'albedoPred.exr'), albedo)
-        mi.util.write_bitmap(os.path.join(output_dir,'normalPred.exr'), normal)
-        mi.util.write_bitmap(os.path.join(output_dir,'roughnessPred.png'), roughness)
-        mi.util.write_bitmap(os.path.join(output_dir,'metallicPred.png'), metallic)
-        mi.util.write_bitmap(os.path.join(output_dir,'depthPred.exr'), depth)
-        mi.util.write_bitmap(os.path.join(output_dir,'gt_image.exr'), img_inverse)
-        mi.util.write_bitmap(os.path.join(output_dir,'gt_image.png'), img_inverse)
-        config = {
-            'img_path': img_inverse_path,
-            'save_name': save_name,
-            'opt_src': opt_src,
-            'opt_order': opt_order,
-            'use_mask': use_mask,
-            'opt_env_from': opt_env_from,
-            'env_coordinate_type': env_coordinate_type,
-            'model_name': model_name,
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        matnet = matnet.cuda().eval()
+        pred_mat, img_inverse, preprocess_meta = matnet.infer_image_scaled(
+            raw_image,
+            scale=work_scale,
+        )
+    else:
+        work_h = max(1, int(round(original_h * work_scale)))
+        work_w = max(1, int(round(original_w * work_scale)))
+        interpolation = cv2.INTER_AREA if work_scale <= 1.0 else cv2.INTER_CUBIC
+        img_inverse = cv2.resize(raw_image, (work_w, work_h), interpolation=interpolation)
+        preprocess_meta = {
+            "original_size": [original_w, original_h],
+            "work_size": [work_w, work_h],
+            "crop_box": [0, 0, original_w, original_h],
+            "scale_x": work_w / float(original_w),
+            "scale_y": work_h / float(original_h),
+            "pixel_transform": [
+                [work_w / float(original_w), 0.0, 0.0],
+                [0.0, work_h / float(original_h), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "center_crop": False,
         }
 
-        # Save additional parameters about the scene and optimization
-        config['image_size'] = img_inverse.shape[:2]
-        config['spp'] = spp
-        config['output_type'] = 'armn' if 'n' in str(opt_order) else 'arm'
-        config['use_mesh_normal'] = not ('n' in str(opt_order))
+    work_h, work_w = img_inverse.shape[:2]
+    K_work = scale_intrinsics(
+        geo_camera.K,
+        source_hw=(original_h, original_w),
+        target_hw=(work_h, work_w),
+        preprocess_meta=preprocess_meta,
+    )
+    K_work = make_mitsuba_compatible_K(K_work)
 
-        # Write configuration to JSON file
-        with open(os.path.join(output_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=4)
+    camera_meta_path = os.path.join(output_dir, "camera_meta.json")
+    camera_meta = write_materialist_camera_json(
+        camera_meta_path,
+        K_work=K_work,
+        work_hw=(work_h, work_w),
+        geocalib_result=geo_camera,
+        preprocess_meta=preprocess_meta,
+    )
 
-        print(f"Configuration saved to {os.path.join(output_dir, 'config.json')}")
+    c2w = torch.tensor(camera_meta["to_world"], dtype=torch.float32)[0][:3, :]
+    cam_cfg = {
+        "to_world": c2w,
+        "fov": float(camera_meta["y_fov"][0]),
+        "fov_axis": "y",
+        "K": torch.from_numpy(K_work),
+        "width": work_w,
+        "height": work_h,
+    }
+
+    print("Camera configuration:")
+    print(f"  source        = {camera_source}")
+    print(f"  original size = {original_w} x {original_h}")
+    print(f"  working size  = {work_w} x {work_h}")
+    print(f"  hfov / vfov   = {camera_meta['x_fov'][0]:.3f} / {camera_meta['y_fov'][0]:.3f} deg")
+    print(f"  fx / fy       = {K_work[0, 0]:.3f} / {K_work[1, 1]:.3f} px")
+    print("  GeoCalib roll/pitch ignored; Materialist pose is fixed.")
+
+    if pred_mat is not None:
+        albedo = pred_mat["albedo"]
+        normal = pred_mat["normal"]
+        roughness = pred_mat["roughness"]
+        metallic = pred_mat["metallic"]
+        depth = pred_mat["depth"]
+
+        if depth.shape[:2] != (work_h, work_w):
+            raise RuntimeError(f"Depth size {depth.shape[:2]} != working size {(work_h, work_w)}")
+
+        mat = {
+            "gt_image": torch.from_numpy(img_inverse).float().div(255.0).cuda(),
+            "albedo": torch.from_numpy(albedo).cuda().clamp(0, 1),
+            "normal": torch.from_numpy(normal).cuda(),
+            "roughness": torch.from_numpy(roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
+            "metallic": torch.from_numpy(metallic).unsqueeze(-1).cuda().clamp(0, 1),
+            "depth": torch.from_numpy(depth).unsqueeze(-1).cuda(),
+        }
+
+        mi.util.write_bitmap(os.path.join(output_dir, "albedoPred.exr"), albedo)
+        mi.util.write_bitmap(os.path.join(output_dir, "normalPred.exr"), normal)
+        mi.util.write_bitmap(os.path.join(output_dir, "roughnessPred.png"), roughness)
+        mi.util.write_bitmap(os.path.join(output_dir, "metallicPred.png"), metallic)
+        mi.util.write_bitmap(os.path.join(output_dir, "depthPred.exr"), depth)
+        mi.util.write_bitmap(os.path.join(output_dir, "gt_image.exr"), img_inverse)
+        mi.util.write_bitmap(os.path.join(output_dir, "gt_image.png"), img_inverse)
+
+        config = {
+            "img_path": img_inverse_path,
+            "save_name": save_name,
+            "opt_src": opt_src,
+            "opt_order": opt_order,
+            "use_mask": use_mask,
+            "opt_env_from": opt_env_from,
+            "env_coordinate_type": env_coordinate_type,
+            "model_name": model_name,
+            "work_scale": work_scale,
+            "camera_source": camera_source,
+            "camera_meta_path": camera_meta_path,
+            "image_size": [work_h, work_w],
+            "spp": spp,
+            "output_type": "armn" if "n" in str(opt_order) else "arm",
+            "use_mesh_normal": not ("n" in str(opt_order)),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as file:
+            json.dump(config, file, indent=4, ensure_ascii=False)
 
         if use_mask:
-            mask_root_dir = os.path.join(output_dir, 'best_results')
-            if os.path.exists(os.path.join(mask_root_dir, 'mask.png')):
-                mask = plt.imread(os.path.join(mask_root_dir, 'mask.png'))
-                mask = torch.tensor(np.array(mask)).bool().cuda()[...,0]
-                mat['mask'] = mask
+            mask_root_dir = os.path.join(output_dir, "best_results")
+            mask_path = os.path.join(mask_root_dir, "mask.png")
+            if os.path.exists(mask_path):
+                mask = plt.imread(mask_path)
+                mask = torch.tensor(np.asarray(mask)).bool().cuda()[..., 0]
+                mat["mask"] = mask
             else:
-                warnings.warn('No mask found, Do you want to continue without mask?', UserWarning)
+                warnings.warn("No mask found; continuing without mask.", UserWarning)
                 countdown(20)
                 use_mask = False
-        
+
         mesh_path = os.path.join(output_dir,f'{save_name}.ply')
         mesh_mask_path = os.path.join(output_dir,'mesh_mask.png')
+        mesh_mask = None
         if os.path.exists(mesh_mask_path):
             mesh_mask = plt.imread(mesh_mask_path)
             mesh_mask = np.array(mesh_mask, dtype=np.bool_)
             if mesh_mask.ndim > 2:  # If it's an RGB image, use only the first channel
                 mesh_mask = mesh_mask[..., 0]
-        if not os.path.exists(mesh_path):
-            depth = 2 * depth.max() - depth
-            if os.path.exists(mesh_mask_path):
-                depth[mesh_mask] = 0
+        if rebuild_mesh or not os.path.exists(mesh_path):
+            depth_for_mesh = 2 * depth.max() - depth
+            if mesh_mask is not None:
+                depth_for_mesh[mesh_mask] = 0
                 print(f"Applied mask from {mesh_mask_path} to depth map")
-            mesh, b_points  = depth_file_to_mesh(depth,cameraMatrix=None, minAngle=6, sun3d=False, depthScale=1.0)
+            mesh, b_points  = depth_file_to_mesh(depth_for_mesh,cameraMatrix=K_work, minAngle=6, sun3d=False, depthScale=1.0)
             mesh = rotate_mesh_around_x(mesh, 180)
             o3d.io.write_triangle_mesh(mesh_path, mesh)
+            print(f"Rebuilt mesh with per-image K: {mesh_path}")
+        else:
+            print(f"Using existing mesh: {mesh_path}")
+            print("Pass --rebuild_mesh after changing image scale or camera intrinsics.")
 
         if opt_env_from > 1:
-            opt_envmap_path = os.path.join(output_dir,'best_results','envmap.hdr')
+            opt_envmap_path = os.path.join(output_dir, "best_results", "envmap.hdr")
             if os.path.exists(opt_envmap_path):
-                print(f'Load envmap from {opt_envmap_path}')
-                mat['gt_envmap'] = torch.from_numpy(np.array(mi.Bitmap(opt_envmap_path))).cuda()
+                print(f"Load envmap from {opt_envmap_path}")
+                mat["gt_envmap"] = torch.from_numpy(
+                    np.array(mi.Bitmap(opt_envmap_path))
+                ).cuda()
             else:
-                print(f'No envmap found in {opt_envmap_path}, will use envmap=1 instead')
-
+                print(f"No envmap found in {opt_envmap_path}; using envmap=1 instead")
     else:
-        print('Load Pre Opted Brdf')
-        mesh_path = os.path.join(output_dir,f'{save_name}.ply')
-        opted_albedo = np.array(mi.Bitmap(os.path.join(output_dir,'best_results','albedo.exr')),dtype=np.float32)
-        opted_roughness = np.array(mi.Bitmap(os.path.join(output_dir,'best_results','roughness.exr')),dtype=np.float32)
-        opted_metallic = np.array(mi.Bitmap(os.path.join(output_dir,'best_results','metallic.exr')),dtype=np.float32)
-        opted_normal = np.array(mi.Bitmap(os.path.join(output_dir,'best_results','normal.exr')),dtype=np.float32)
-        mat = {}
-        mat['albedo'] = torch.from_numpy(opted_albedo).cuda().clamp(0,1)
-        mat['roughness'] = torch.from_numpy(opted_roughness).unsqueeze(-1).cuda().clamp(0.07,1)
-        mat['metallic'] = torch.from_numpy(opted_metallic).unsqueeze(-1).cuda().clamp(0,1)
-        mat['normal'] = torch.from_numpy(opted_normal).cuda()
-        mat['gt_image'] = torch.from_numpy(img_inverse).cuda()
+        print("Load pre-optimized BRDF")
+        mesh_path = os.path.join(output_dir, f"{save_name}.ply")
+        opted_albedo = np.array(mi.Bitmap(os.path.join(output_dir, "best_results", "albedo.exr")), dtype=np.float32)
+        opted_roughness = np.array(mi.Bitmap(os.path.join(output_dir, "best_results", "roughness.exr")), dtype=np.float32)
+        opted_metallic = np.array(mi.Bitmap(os.path.join(output_dir, "best_results", "metallic.exr")), dtype=np.float32)
+        opted_normal = np.array(mi.Bitmap(os.path.join(output_dir, "best_results", "normal.exr")), dtype=np.float32)
+        mat = {
+            "albedo": torch.from_numpy(opted_albedo).cuda().clamp(0, 1),
+            "roughness": torch.from_numpy(opted_roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
+            "metallic": torch.from_numpy(opted_metallic).unsqueeze(-1).cuda().clamp(0, 1),
+            "normal": torch.from_numpy(opted_normal).cuda(),
+            "gt_image": torch.from_numpy(img_inverse).float().div(255.0).cuda(),
+        }
 
-    if 'n' in str(opt_order):
+    if "n" in str(opt_order):
         use_mesh_normal = False
-        output_type = 'armn'
-        print('Use normal map')
+        output_type = "armn"
+        print("Use normal map")
     else:
         use_mesh_normal = True
-        output_type = 'arm'
-        print('Use mesh normal')
-    scene = load_estimated_mesh(mesh_path,use_mesh_normal)
-    optimize_envmap_ARMN(cam_cfg=cam_cfg,scene=scene,
-                    save_folder=save_name,
-                    mat=mat,use_mesh_normal=use_mesh_normal,
-                    output_type=output_type,optimize_order=opt_order,
-                    use_gt_scene=False,
-                    model_name=model_name,
-                    spp=spp,
-                    opt_env_from=opt_env_from,
-                    opt_src=opt_src,
-                    use_mask=use_mask,
-                    save_path=save_path,
-                    env_coordinate_type=env_coordinate_type)
+        output_type = "arm"
+        print("Use mesh normal")
+
+    scene = load_estimated_mesh(mesh_path, use_mesh_normal, camera_meta_path)
+    optimize_envmap_ARMN(
+        cam_cfg=cam_cfg,
+        scene=scene,
+        save_folder=save_name,
+        mat=mat,
+        use_mesh_normal=use_mesh_normal,
+        output_type=output_type,
+        optimize_order=opt_order,
+        use_gt_scene=False,
+        model_name=model_name,
+        spp=spp,
+        opt_env_from=opt_env_from,
+        opt_src=opt_src,
+        use_mask=use_mask,
+        save_path=save_path,
+        env_coordinate_type=env_coordinate_type,
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description=('inverse a given image'))
-    parser.add_argument('--img_inverse_path', required=True,type=str, help='img_inverse_path')
-    parser.add_argument('--save_name',required=True,type=str,help='save_name')
-    parser.add_argument('--opt_src',required=True,type=str,default='arm',help='if use predicted albedo,roughness,metallic to optimize')
-    parser.add_argument('--opt_order',required=False, nargs='+',default=['arm'],help='optimize order')
-    parser.add_argument('--use_mask',required=False,action='store_true',help='use mask')
-    parser.add_argument('--opt_env_from', required=False,default=0,type=int,help='start env opt from n-th round')
-    parser.add_argument('--save_path', required=False, default=None, type=str, help='path to save results')
-    parser.add_argument('--env_coordinate_type', required=False, default='spherical',
-                        choices=['spherical', 'uv'],
-                        help='coordinate parameterization for the optimized environment map MLP')
-    parser.add_argument('--model_name', required=False, default='pos_mlp', type=str, choices=['pos_mlp', 'none'], 
-                        help='model to use for optimization (pos_mlp or none)')
+        description="Inverse-render a given image",
+    )
+    parser.add_argument("--img_inverse_path", required=True, type=str)
+    parser.add_argument("--save_name", required=True, type=str)
+    parser.add_argument("--opt_src", required=True, type=str, default="arm")
+    parser.add_argument("--opt_order", nargs="+", default=["arm"])
+    parser.add_argument("--use_mask", action="store_true")
+    parser.add_argument("--opt_env_from", default=0, type=int)
+    parser.add_argument("--save_path", default=None, type=str)
+    parser.add_argument(
+        "--env_coordinate_type",
+        default="spherical",
+        choices=["spherical", "uv"],
+    )
+    parser.add_argument(
+        "--model_name",
+        default="pos_mlp",
+        choices=["pos_mlp", "none"],
+    )
+    parser.add_argument(
+        "--work_scale",
+        default=0.5,
+        type=float,
+        help="Aspect-ratio-preserving scale applied to the complete input image",
+    )
+    parser.add_argument(
+        "--camera_source",
+        default="geocalib",
+        choices=["geocalib", "fixed35"],
+        help="Use GeoCalib focal initialization or the original 35-degree fallback",
+    )
+    parser.add_argument(
+        "--rebuild_mesh",
+        action="store_true",
+        help="Regenerate the mesh with the current working-resolution K",
+    )
     return parser.parse_args()
 
 
-
 def inverse_real(args):
-    img_path = args.img_inverse_path
-    save_name = args.save_name
-    opt_src = args.opt_src
-    opt_order = args.opt_order
-    save_path = args.save_path
-    inverse_image(img_path, save_name, opt_src, opt_order, 
-                 use_mask=args.use_mask, 
-                 opt_env_from=args.opt_env_from,
-                 save_path=save_path,
-                 env_coordinate_type=args.env_coordinate_type)
+    inverse_image(
+        args.img_inverse_path,
+        args.save_name,
+        args.opt_src,
+        args.opt_order,
+        use_mask=args.use_mask,
+        opt_env_from=args.opt_env_from,
+        save_path=args.save_path,
+        env_coordinate_type=args.env_coordinate_type,
+        model_name=args.model_name,
+        work_scale=args.work_scale,
+        camera_source=args.camera_source,
+        rebuild_mesh=args.rebuild_mesh,
+    )
 
 
 if __name__ == '__main__':

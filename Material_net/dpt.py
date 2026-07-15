@@ -8,6 +8,7 @@ from .dinov2 import DINOv2
 from .util.blocks import FeatureFusionBlock, _make_scratch
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 import warnings
+import numpy as np
 
 def _make_fusion_block(features, use_bn, size=None):
     return FeatureFusionBlock(
@@ -215,6 +216,152 @@ class MaterialNet(nn.Module):
             'normal': normal
         }
         return out
+    
+    @torch.no_grad()
+    def infer_image_scaled(
+        self,
+        raw_image: np.ndarray,
+        scale: float = 0.5,
+        patch_size: int = 14,
+    ):
+        """
+        保持输入图像宽高比，将分辨率缩小 scale 倍，
+        然后 padding 到 patch_size 的整数倍。
+
+        Args:
+            raw_image:
+                H x W x 3 的 numpy 图像。
+                uint8 输入范围应为 [0, 255]；
+                float 输入通常应为 [0, 1]。
+            scale:
+                网络工作分辨率相对于输入图像的比例。
+                scale=0.5 表示长宽分别缩小两倍。
+            patch_size:
+                DINOv2 ViT-B/14 的 patch size，固定为 14。
+
+        Returns:
+            pred:
+                MatNet 预测结果，所有属性尺寸均为 work_h x work_w。
+            work_image:
+                缩小后的输入图像，不包含 padding，
+                可直接作为后续 inverse rendering 的目标图像。
+            meta:
+                原始尺寸、工作尺寸和网络实际输入尺寸。
+        """
+        if not isinstance(raw_image, np.ndarray):
+            raise TypeError(
+                f"raw_image must be np.ndarray, got {type(raw_image)}"
+            )
+
+        if raw_image.ndim != 3 or raw_image.shape[2] < 3:
+            raise ValueError(
+                f"Expected HxWx3 image, got shape {raw_image.shape}"
+            )
+
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
+
+        # 只保留 RGB，避免某些 PNG 带 alpha 通道。
+        raw_image = raw_image[..., :3]
+
+        orig_h, orig_w = raw_image.shape[:2]
+
+        # 严格按照同一个 scale 缩小，保持宽高比。
+        work_h = max(1, int(round(orig_h * scale)))
+        work_w = max(1, int(round(orig_w * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if work_h < orig_h or work_w < orig_w
+            else cv2.INTER_CUBIC
+        )
+
+        work_image = cv2.resize(
+            raw_image,
+            (work_w, work_h),
+            interpolation=interpolation,
+        )
+
+        # 向上 padding 到 14 的整数倍。
+        # 不直接拉伸到 14n，避免改变图像宽高比。
+        net_h = int(np.ceil(work_h / patch_size) * patch_size)
+        net_w = int(np.ceil(work_w / patch_size) * patch_size)
+
+        pad_bottom = net_h - work_h
+        pad_right = net_w - work_w
+
+        # reflect padding 比填 0 更不容易在边界制造黑色伪影。
+        padded_image = cv2.copyMakeBorder(
+            work_image,
+            top=0,
+            bottom=pad_bottom,
+            left=0,
+            right=pad_right,
+            borderType=cv2.BORDER_REFLECT_101,
+        )
+
+        # 与原始 image2tensor() 保持相同的数据范围处理。
+        if padded_image.dtype == np.uint8:
+            image = padded_image.astype(np.float32) / 255.0
+        else:
+            image = padded_image.astype(np.float32)
+
+        if image.max() > 10:
+            warnings.warn(
+                "Input intensity is unusually high. Dividing by 255.",
+                UserWarning,
+            )
+            image = image / 255.0
+
+        # PrepareForNet 会执行 HWC -> CHW 等转换。
+        transform = Compose([
+            PrepareForNet(),
+        ])
+
+        image = transform({"image": image})["image"]
+        image = torch.from_numpy(image).unsqueeze(0)
+
+        # 跟随模型所在设备，而不是写死 CUDA。
+        device = next(self.parameters()).device
+        image = image.to(device)
+
+        mat_pred = self.forward(image)
+
+        # 网络输出包含 padding 区域，需要裁回实际工作分辨率。
+        depth = mat_pred["depth"][:, :, :work_h, :work_w]
+        albedo = mat_pred["albedo"][:, :, :work_h, :work_w]
+        roughness = mat_pred["roughness"][:, :, :work_h, :work_w]
+        metallic = mat_pred["metallic"][:, :, :work_h, :work_w]
+        normal = mat_pred["normal"][:, :, :work_h, :work_w]
+
+        # 裁剪或插值后重新归一化 normal，保证 ||N|| = 1。
+        normal = F.normalize(
+            normal,
+            p=2,
+            dim=1,
+            eps=1e-6,
+        )
+
+        pred = {
+            "depth": depth[0, 0].cpu().numpy(),
+            "albedo": albedo[0].permute(1, 2, 0).cpu().numpy(),
+            "roughness": roughness[0, 0].cpu().numpy(),
+            "metallic": metallic[0, 0].cpu().numpy(),
+            "normal": normal[0].permute(1, 2, 0).cpu().numpy(),
+        }
+
+        meta = {
+            "original_size": (orig_h, orig_w),
+            "work_size": (work_h, work_w),
+            "network_size": (net_h, net_w),
+            "padding": {
+                "bottom": pad_bottom,
+                "right": pad_right,
+            },
+            "scale": scale,
+        }
+
+        return pred, work_image, meta
     
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):

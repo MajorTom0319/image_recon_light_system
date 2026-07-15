@@ -18,6 +18,11 @@ lt.monkey_patch()
 sys.path.append('../')
 import global_config
 import warnings
+
+# MATERIALIST_DRJIT_DEBUG_ENV
+if os.environ.get('MATERIALIST_DRJIT_DEBUG', '0') == '1':
+    dr.set_flag(dr.JitFlag.Debug, True)
+    torch.autograd.set_detect_anomaly(True)
 warnings.simplefilter('once', UserWarning)
 import math
 # dr.set_flag(dr.JitFlag.VCallRecord, False)
@@ -280,7 +285,33 @@ def mi_diffuse_sampler(sample2, normal):
     wi = dr.select(dr.isnan(wi),mi.Float(0.0),wi)
     return wi
 
+def screen_coordinates_to_indices(
+    screen_coor,
+    image_height,
+    image_width,
+):
+    """
+    world_to_screen 返回顺序为：
+        [row, column] = [y, x]
+    """
+    row = torch.floor(
+        screen_coor[:, 0]
+    ).long()
 
+    col = torch.floor(
+        screen_coor[:, 1]
+    ).long()
+
+    row = row.clamp(
+        min=0,
+        max=image_height - 1,
+    )
+    col = col.clamp(
+        min=0,
+        max=image_width - 1,
+    )
+
+    return row, col
 
 def sample_brdf(sample1, sample2, wo, normal_geo, mat,use_mesh_normal, *args,
                 **kwargs):
@@ -478,7 +509,15 @@ class BaseBRDF(nn.Module):
         if 'bg' in mat.keys():
             bg = mat['bg']
         # screen_coor=kwargs['screen_coor']
-        x,y = torch.floor(screen_coor[:,0]).long(),torch.floor(screen_coor[:,1]).long()
+        # x, y = _safe_screen_indices(screen_coor, roughness)
+
+        image_height, image_width = albedo.shape[:2]
+
+        x, y = screen_coordinates_to_indices(
+            screen_coor,
+            image_height=image_height,
+            image_width=image_width,
+        )
         roughness = roughness[x,y,:]
         albedo = albedo[x,y,:]
         metallic = metallic[x,y,:]
@@ -496,9 +535,9 @@ class BaseBRDF(nn.Module):
         NoH = (normal*h).sum(-1,keepdim=True).relu()
         # breakpoint()
         # get r,a,m by screen coor
-        if screen_coor.max() > 512:
-            print('screen_coor max value should be lower than image width')
-            breakpoint()
+        # if screen_coor.max() > 512:
+        #     print('screen_coor max value should be lower than image width')
+        #     breakpoint()
 
 
         # get pdf
@@ -548,7 +587,16 @@ class BaseBRDF(nn.Module):
 
         albedo,roughness,metallic,normal = mat['albedo'],mat['roughness'],mat['metallic'],mat['normal']
 
-        x,y = torch.floor(screen_coor[:,0]).long(),torch.floor(screen_coor[:,1]).long()
+        # x, y = _safe_screen_indices(screen_coor, roughness)
+
+        image_height, image_width = albedo.shape[:2]
+
+        x, y = screen_coordinates_to_indices(
+            screen_coor,
+            image_height=image_height,
+            image_width=image_width,
+        )
+
         roughness = roughness[x,y,:]
         normal = normal[x,y,:]
         if use_mesh_normal:
@@ -569,6 +617,78 @@ class BaseBRDF(nn.Module):
         brdf_weight[brdf_weight.isnan()] = 0
 
         return wi,pdf,brdf_weight
+
+
+def intrinsics_projection_matrix(
+    K,
+    width,
+    height,
+    near,
+    far,
+):
+    """
+    根据 OpenCV 风格内参 K 构造与 Materialist 当前坐标约定
+    相兼容的 OpenGL projection matrix。
+
+    K:
+        [[fx, 0, cx],
+         [0, fy, cy],
+         [0,  0,  1]]
+    """
+    K = torch.as_tensor(
+        K,
+        dtype=torch.float32,
+    )
+
+    fx = K[0, 0]
+    fy = K[1, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+
+    width = float(width)
+    height = float(height)
+
+    projection = torch.zeros(
+        (4, 4),
+        dtype=torch.float32,
+    )
+
+    projection[0, 0] = 2.0 * fx / width
+    projection[1, 1] = 2.0 * fy / height
+
+    # 支持非中心主点。
+    projection[0, 2] = 1.0 - 2.0 * cx / width
+    projection[1, 2] = 1.0 - 2.0 * cy / height
+
+    projection[2, 2] = (
+        (far + near) / (near - far)
+    )
+    projection[2, 3] = (
+        2.0 * far * near / (near - far)
+    )
+    projection[3, 2] = -1.0
+
+    return projection
+
+# MATERIALIST_SAFE_TEXTURE_INDEX: clamp against actual texture shape.
+def _safe_screen_indices(screen_coor, texture):
+    if texture.ndim < 2:
+        raise ValueError(f"Expected image-like texture, got shape={tuple(texture.shape)}")
+    height = int(texture.shape[0])
+    width = int(texture.shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid texture shape={tuple(texture.shape)}")
+
+    row = torch.nan_to_num(
+        screen_coor[:, 0], nan=0.0, posinf=float(height - 1), neginf=0.0
+    )
+    col = torch.nan_to_num(
+        screen_coor[:, 1], nan=0.0, posinf=float(width - 1), neginf=0.0
+    )
+    row = torch.floor(row).clamp(0, height - 1).to(dtype=torch.long)
+    col = torch.floor(col).clamp(0, width - 1).to(dtype=torch.long)
+    return row, col
+
 
 def perspective_projection_matrix_numpy(fov, aspect, near, far):
     """Generate perspective projection matrix
@@ -640,35 +760,63 @@ def world_to_screen(world_coords, view_matrix, projection_matrix, screen_width, 
     x_screen = (ndc_coords[:, 0] + 1) * 0.5 * screen_width
     y_screen = (ndc_coords[:, 1] + 1) * 0.5 * screen_height
 
+    # MATERIALIST_SAFE_SCREEN_CLAMP: prevent invalid advanced indices in MatDiffBSDF.
+    # Border hits may evaluate to exactly width/height; transformed rays can
+    # also produce tiny overshoots, NaN, or Inf due to numerical error.
+    max_x = max(float(screen_width) - 1.0, 0.0)
+    max_y = max(float(screen_height) - 1.0, 0.0)
+    x_screen = torch.nan_to_num(
+        x_screen, nan=0.0, posinf=max_x, neginf=0.0
+    )
+    y_screen = torch.nan_to_num(
+        y_screen, nan=0.0, posinf=max_y, neginf=0.0
+    )
+    x_screen = torch.clamp(x_screen, min=0.0, max=max_x)
+    y_screen = torch.clamp(y_screen, min=0.0, max=max_y)
     return torch.stack((y_screen, x_screen), dim=-1)
 
 def mi_world_to_screen(world_coords, view_matrix, projection_matrix, screen_width, screen_height):
-    """Convert batch world coordinates to screen coordinates using Mitsuba/Dr.Jit."""
-
-    # Convert world coordinates to 4D homogeneous coordinates
+    """Convert world coordinates to clamped Mitsuba pixel coordinates (x, y)."""
     ones = mi.Float(1.0)
-    world_coords_h = mi.Vector4f(world_coords[0], world_coords[1], world_coords[2], ones)
-
-    # Convert world coordinates to camera coordinates
+    world_coords_h = mi.Vector4f(
+        world_coords[0], world_coords[1], world_coords[2], ones
+    )
     camera_coords = view_matrix @ world_coords_h
-
-    # Convert camera coordinates to clip space coordinates
     clip_coords = projection_matrix @ camera_coords
 
-    # Perform perspective division to obtain normalized device coordinates (NDC)
-    ndc_coords = mi.Vector3f(
-        clip_coords[0] / clip_coords[3],
-        clip_coords[1] / clip_coords[3],
-        clip_coords[2] / clip_coords[3]
+    safe_w = dr.select(dr.abs(clip_coords[3]) > 1e-8, clip_coords[3], 1e-8)
+    ndc_x = clip_coords[0] / safe_w
+    ndc_y = clip_coords[1] / safe_w
+
+    x_screen = (ndc_x + 1.0) * 0.5 * float(screen_width)
+    y_screen = (ndc_y + 1.0) * 0.5 * float(screen_height)
+
+    x_screen = dr.select(dr.isfinite(x_screen), x_screen, 0.0)
+    y_screen = dr.select(dr.isfinite(y_screen), y_screen, 0.0)
+    x_screen = dr.minimum(
+        dr.maximum(x_screen, 0.0),
+        max(float(screen_width) - 1.0, 0.0),
     )
-
-    # Convert NDC coordinates to screen coordinates
-    x_screen = (ndc_coords[0] + 1) * 0.5 * screen_width
-    y_screen = (ndc_coords[1] + 1) * 0.5 * screen_height
-
-    # Stack and return screen coordinates
-    # return mi.Vector2f(y_screen, x_screen)
+    y_screen = dr.minimum(
+        dr.maximum(y_screen, 0.0),
+        max(float(screen_height) - 1.0, 0.0),
+    )
     return mi.Vector2f(x_screen, y_screen)
+
+
+def _mi_safe_flat_index(screen_coor, texture):
+    """Return a clamped row-major flat index for an HxW[xC] Mitsuba tensor."""
+    height = int(texture.shape[0])
+    width = int(texture.shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid texture shape: {texture.shape}")
+
+    x = mi.Int(dr.floor(screen_coor[0]))
+    y = mi.Int(dr.floor(screen_coor[1]))
+    x = dr.minimum(dr.maximum(x, 0), width - 1)
+    y = dr.minimum(dr.maximum(y, 0), height - 1)
+    return x + y * width
+
 
 def comp_refract_dir(wo, normal, ior):
     """ Compute refraction direction using Snell's law
@@ -804,7 +952,18 @@ class MatBSDF(mi.BSDF):
         farclip = self.cam_meta['far_clip']
 
 
-        self.persp_proj_matx = perspective_projection_matrix(fov, self.width/self.height, nearclip, farclip)
+        # camera_meta stores x_fov and y_fov separately for non-square images.
+        if "y_fov" in self.cam_meta:
+            vertical_fov = torch.deg2rad(
+                torch.tensor(float(self.cam_meta["y_fov"][0]))
+            )
+        else:
+            horizontal_fov_for_projection = fov
+            aspect_for_projection = self.width / self.height
+            vertical_fov = 2.0 * torch.atan(
+                torch.tan(0.5 * horizontal_fov_for_projection) / aspect_for_projection
+            )
+        self.persp_proj_matx = perspective_projection_matrix(vertical_fov, self.width/self.height, nearclip, farclip)
 
     def sample(self, ctx, si, sample1, sample2, active):
         # cos_theta = mi.Frame3f.cos_theta(si.wi)
@@ -930,7 +1089,7 @@ class RefractBaseBRDF(BaseBRDF):
         mask = mat['mask'].bool()
         roughness[mask] = 0.1
 
-        x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+        x, y = _safe_screen_indices(screen_coor, roughness)
         roughness = roughness[x, y, :]
         if self.use_mesh_normal:
             normal = normal_mesh
@@ -977,11 +1136,19 @@ class RefractBaseBRDF(BaseBRDF):
         roughness[mask] = 0.1
         if not self.keep_albedo_color:
             albedo[mask] = 0.9
-        x,y = torch.floor(screen_coor[:,0]).long(),torch.floor(screen_coor[:,1]).long()
+        # x, y = _safe_screen_indices(screen_coor, roughness)
+
+        image_height, image_width = albedo.shape[:2]
+
+        x, y = screen_coordinates_to_indices(
+            screen_coor,
+            image_height=image_height,
+            image_width=image_width,
+        )
 
         mask = mask[x,y]
         refracted_screen_coor[~mask] = screen_coor[~mask]
-        x_refract,y_refract = torch.floor(refracted_screen_coor[:,0]).long(),torch.floor(refracted_screen_coor[:,1]).long()
+        x_refract, y_refract = _safe_screen_indices(refracted_screen_coor, bg)
 
         roughness = roughness[x,y,:]
 
@@ -1087,7 +1254,7 @@ class MatrefractBSDF(MatBSDF):
         ior_ratio = 1.0 / self.ior
         #1st refract
         refracted_dir1 = self.calculate_refraction(wi, normal, ior_ratio)
-        x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+        x, y = _safe_screen_indices(screen_coor, roughness)
         # refract_distance1 = self.path_length[x, y, 2:3]
         refracted_position1 = position + 0.3 * self.refract_distance * refracted_dir1
         refracted_screen_coor1 = world_to_screen(refracted_position1, self.view_matrix, self.persp_proj_matx, self.width, self.height)
@@ -1116,7 +1283,7 @@ class MatrefractBSDF(MatBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
         # Calculate refraction direction
         refracted_screen_coor = self.calculate_refracted_screen_coor(wi, normal, 1.0 / self.ior, position, screen_coor)
@@ -1153,7 +1320,7 @@ class MatrefractBSDF(MatBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
         brdf, _ = self.base_brdf.eval_brdf(wo, wi, normal, self.mat, screen_coor,refracted_screen_coor)
         brdf = mi.Vector3f(brdf[..., 0], brdf[..., 1], brdf[..., 2])
@@ -1172,7 +1339,7 @@ class MatrefractBSDF(MatBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
 
         refracted_screen_coor = self.calculate_refracted_screen_coor(wi, normal, 1.0 / self.ior, position, screen_coor)
@@ -1196,7 +1363,7 @@ class MatrefractBSDF(MatBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
         refracted_screen_coor = self.calculate_refracted_screen_coor(wi, normal, 1.0 / self.ior, position, screen_coor)
 
@@ -1232,52 +1399,101 @@ def to_mitsuba(tensor):
 class MatDiffBSDF(mi.BSDF):
     def __init__(self, props):
         mi.BSDF.__init__(self, props)
-        self.m_flags = mi.BSDFFlags.SpatiallyVarying|mi.BSDFFlags.DiffuseReflection|mi.BSDFFlags.FrontSide #| mi.BSDFFlags.BackSide
+        self.m_flags = (
+            mi.BSDFFlags.SpatiallyVarying
+            | mi.BSDFFlags.DiffuseReflection
+            | mi.BSDFFlags.FrontSide
+        )
         self.m_components = [self.m_flags]
-        if props.has_property('use_mesh_normal'):
-            self.use_mesh_normal = props['use_mesh_normal']
-        else:
-            self.use_mesh_normal = True
-        self.a = mi.TensorXf(np.full((512, 512, 3), 0.5, dtype=np.float32))
-        self.r = mi.TensorXf(np.full((512, 512, 1), 0.5, dtype=np.float32))
-        self.m = mi.TensorXf(np.full((512, 512, 1), 0.5, dtype=np.float32))
-        self.n = mi.TensorXf(np.full((512, 512, 3), 0.5, dtype=np.float32))
+        self.use_mesh_normal = (
+            props["use_mesh_normal"] if props.has_property("use_mesh_normal") else True
+        )
 
-        if props.has_property('mat_dir'):
-            self.mat = load_estimated_brdf(props['mat_dir'])
-            # pred_mat_dir = props['pred_mat_dir']
-            # self.mat = self.load_pred_brdf(pred_mat_dir)
-            keys = self.mat.keys()
-            for key in keys:
-                if key != 'mask':
+        if props.has_property("cam_meta"):
+            with open(props["cam_meta"], "r", encoding="utf-8") as file:
+                self.cam_meta = json.load(file)
+        else:
+            with open(
+                os.path.join(global_config.RESOURCE_DIR, "camera.json"),
+                "r",
+                encoding="utf-8",
+            ) as file:
+                self.cam_meta = json.load(file)
+
+        self.width, self.height = [int(v) for v in self.cam_meta["film.size"]]
+
+        # Initialize textures with the actual camera resolution instead of 512x512.
+        self.a = mi.TensorXf(
+            np.full((self.height, self.width, 3), 0.5, dtype=np.float32)
+        )
+        self.r = mi.TensorXf(
+            np.full((self.height, self.width, 1), 0.5, dtype=np.float32)
+        )
+        self.m = mi.TensorXf(
+            np.full((self.height, self.width, 1), 0.5, dtype=np.float32)
+        )
+        self.n = mi.TensorXf(
+            np.full((self.height, self.width, 3), 0.5, dtype=np.float32)
+        )
+
+        if props.has_property("mat_dir"):
+            self.mat = load_estimated_brdf(props["mat_dir"])
+            for key in self.mat.keys():
+                if key != "mask":
                     self.mat[key] = mi.TensorXf(self.mat[key])
-            self.a = mi.TensorXf(self.mat['albedo'])
-            self.r = mi.TensorXf(self.mat['roughness'])
-            self.m = mi.TensorXf(self.mat['metallic'])
-            print('Load optimized BRDF from:',props['mat_dir'])
+            self.a = mi.TensorXf(self.mat["albedo"])
+            self.r = mi.TensorXf(self.mat["roughness"])
+            self.m = mi.TensorXf(self.mat["metallic"])
+            if "normal" in self.mat:
+                self.n = mi.TensorXf(self.mat["normal"])
+            print("Load optimized BRDF from:", props["mat_dir"])
         else:
             self.mat = {}
-            print('No BRDF loaded, need to update BRDF params by mi.traverse')
+            print("No BRDF loaded, need to update BRDF params by mi.traverse")
 
-        if props.has_property('cam_meta'):
-            self.cam_meta = json.load(open(props['cam_meta']))
-        else:
-            self.cam_meta = json.load(open(os.path.join(global_config.RESOURCE_DIR, "camera.json")))
-        to_world = torch.tensor(self.cam_meta['to_world'])[0]
+        to_world = torch.tensor(self.cam_meta["to_world"], dtype=torch.float32)[0]
         self.view_matrix = torch.inverse(to_world)
+        self.R = to_world[:3, :3]
+        nearclip = float(self.cam_meta.get("near_clip", 0.01))
+        farclip = float(self.cam_meta.get("far_clip", 10000.0))
 
-        self.width, self.height = self.cam_meta['film.size']
-
-        if props.has_property('fov'):
-            fov = torch.deg2rad(torch.tensor(float(props['fov'])))
+        if "K" in self.cam_meta:
+            self.K = torch.tensor(self.cam_meta["K"], dtype=torch.float32)
+            self.focal = self.K[1, 1]
+            projection = intrinsics_projection_matrix(
+                self.K,
+                width=self.width,
+                height=self.height,
+                near=nearclip,
+                far=farclip,
+            )
         else:
-            fov = torch.deg2rad(torch.tensor(self.cam_meta['x_fov'][0]))
-        self.focal = 0.5*self.width/torch.tan(0.5*fov)
-        self.R = to_world[:3,:3]
-        nearclip = self.cam_meta['near_clip']
-        farclip = self.cam_meta['far_clip']
-        self.persp_proj_matx = perspective_projection_matrix(fov, self.width/self.height, nearclip, farclip)
-        self.persp_proj_matx = mi.Matrix4f(self.persp_proj_matx.numpy())
+            if "y_fov" in self.cam_meta:
+                vertical_fov = torch.deg2rad(
+                    torch.tensor(float(self.cam_meta["y_fov"][0]), dtype=torch.float32)
+                )
+            else:
+                if props.has_property("fov"):
+                    horizontal_fov = torch.deg2rad(
+                        torch.tensor(float(props["fov"]), dtype=torch.float32)
+                    )
+                else:
+                    horizontal_fov = torch.deg2rad(
+                        torch.tensor(float(self.cam_meta["x_fov"][0]), dtype=torch.float32)
+                    )
+                aspect = self.width / float(self.height)
+                vertical_fov = 2.0 * torch.atan(
+                    torch.tan(horizontal_fov * 0.5) / aspect
+                )
+            self.focal = 0.5 * self.height / torch.tan(vertical_fov * 0.5)
+            projection = perspective_projection_matrix(
+                vertical_fov,
+                self.width / float(self.height),
+                nearclip,
+                farclip,
+            )
+
+        self.persp_proj_matx = mi.Matrix4f(projection.numpy())
         self.view_matrix = mi.Matrix4f(self.view_matrix.numpy())
 
     def load_pred_brdf(self,pred_mat_dir):
@@ -1310,10 +1526,7 @@ class MatDiffBSDF(mi.BSDF):
 
         roughness = self.r
 
-        x = mi.Int(dr.floor(screen_coor[0]))
-        y = mi.Int(dr.floor(screen_coor[1]))
-
-        flat_index = x + y * roughness.shape[0]
+        flat_index = _mi_safe_flat_index(screen_coor, roughness)
         roughness = dr.gather(mi.Float, roughness.array, flat_index)
         if self.use_mesh_normal:
             normal = normal_mesh
@@ -1381,10 +1594,7 @@ class MatDiffBSDF(mi.BSDF):
         roughness = self.r
         metallic = self.m
         # get r,a,m by screen coor
-        x = mi.Int(dr.floor(screen_coor[0]))
-        y = mi.Int(dr.floor(screen_coor[1]))
-
-        flat_index = x + y * roughness.shape[0]
+        flat_index = _mi_safe_flat_index(screen_coor, roughness)
 
         albedo = dr.gather(mi.Vector3f, albedo.array, flat_index)
         roughness = dr.gather(mi.Float, roughness.array, flat_index)
@@ -1562,7 +1772,7 @@ class TransBSDF(MatDiffBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
         brdf, _ = self.eval_brdf(wo, wi, normal, self.mat, screen_coor,refracted_screen_coor)
         # brdf = mi.Vector3f(brdf[..., 0], brdf[..., 1], brdf[..., 2])
@@ -1581,10 +1791,7 @@ class TransBSDF(MatDiffBSDF):
         roughness = self.r
         
 
-        x = mi.Int(dr.floor(screen_coor[0]))
-        y = mi.Int(dr.floor(screen_coor[1]))
-
-        flat_index = x + y * roughness.shape[0]
+        flat_index = _mi_safe_flat_index(screen_coor, roughness)
         roughness = dr.gather(mi.Float, roughness.array, flat_index)
         # mask = dr.gather(mi.Bool, self.mask.array, flat_index)
         # roughness[mask] = 0.1
@@ -1629,15 +1836,11 @@ class TransBSDF(MatDiffBSDF):
         mask = self.mask
 
         # get r,a,m by screen coor
-        x = mi.Int(dr.floor(screen_coor[0]))
-        y = mi.Int(dr.floor(screen_coor[1]))
-        flat_index = x + y * roughness.shape[0]
+        flat_index = _mi_safe_flat_index(screen_coor, roughness)
         mask = dr.gather(mi.Bool, mask.array, flat_index)
 
         refracted_screen_coor[~mask] = screen_coor[~mask]
-        x_refract = mi.Int(dr.floor(refracted_screen_coor[0]))
-        y_refract = mi.Int(dr.floor(refracted_screen_coor[1]))
-        flat_index_refract = x_refract + y_refract * roughness.shape[0]
+        flat_index_refract = _mi_safe_flat_index(refracted_screen_coor, roughness)
 
         albedo = dr.gather(mi.Vector3f, albedo.array, flat_index)
         roughness = dr.gather(mi.Float, roughness.array, flat_index)
@@ -1743,7 +1946,7 @@ class TransBSDF(MatDiffBSDF):
             normal = normal_mesh
         else:
             normal = self.mat['normal']
-            x, y = torch.floor(screen_coor[:, 0]).long(), torch.floor(screen_coor[:, 1]).long()
+            x, y = _safe_screen_indices(screen_coor, roughness)
             normal = normal[x, y, :]
 
         refracted_screen_coor = self.calculate_refracted_screen_coor(wi, normal, 1.0 / self.ior, position, screen_coor)
