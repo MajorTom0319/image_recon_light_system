@@ -84,6 +84,42 @@ def load_estimated_mesh(mesh_path, use_mesh_normal, cam_meta_path, max_path=4):
     })
     return scene
 
+def render_mesh_preview(mesh_path, cam_meta_path, output_dir, spp=64):
+    """Render the reconstructed mesh with a plain white diffuse material."""
+    with open(cam_meta_path, "r", encoding="utf-8") as f:
+        camera_meta = json.load(f)
+    width, height = [int(v) for v in camera_meta["film.size"]]
+    vfov_deg = float(camera_meta["y_fov"][0])
+
+    scene = mi.load_dict({
+        "type": "scene",
+        "shape": {
+            "type": "ply",
+            "filename": mesh_path,
+            "bsdf": {"type": "diffuse", "reflectance": 0.8},
+        },
+        "integrator": {"type": "path", "max_depth": 4},
+        "sensor": {
+            "type": "perspective",
+            "fov": vfov_deg,
+            "fov_axis": "y",
+            "to_world": mi.ScalarTransform4f.look_at(
+                origin=[0, 0, 0], target=[0, 0, -1], up=[0, 1, 0]),
+            "film": {"type": "hdrfilm", "width": width, "height": height,
+                     "pixel_format": "rgb"},
+        },
+        "emitter": {"type": "envmap", "filename": "envmaps/0.hdr"},
+    })
+    rendered = mi.render(scene, spp=spp, seed=42)
+    rendered_np = np.array(rendered)
+    mi.util.write_bitmap(os.path.join(output_dir, 'mesh_render.exr'), rendered_np)
+    rendered_srgb = linear_to_srgb(torch.from_numpy(rendered_np)).clamp(0, 1)
+    save_image(rendered_srgb.permute(2, 0, 1).unsqueeze(0),
+               os.path.join(output_dir, 'mesh_render.png'))
+    print(f"Mesh preview saved to {os.path.join(output_dir, 'mesh_render.png')}")
+    del scene, rendered
+    torch.cuda.empty_cache()
+
 
 @dr.wrap_ad(source='torch', target='drjit')
 def render_envmap(scene,envmap,spp=64):
@@ -818,7 +854,7 @@ def inverse_image(
             raise RuntimeError(f"Depth size {depth.shape[:2]} != working size {(work_h, work_w)}")
 
         mat = {
-            "gt_image": torch.from_numpy(img_inverse).float().div(255.0).cuda(),
+            "gt_image": srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda(),
             "albedo": torch.from_numpy(albedo).cuda().clamp(0, 1),
             "normal": torch.from_numpy(normal).cuda(),
             "roughness": torch.from_numpy(roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
@@ -888,6 +924,9 @@ def inverse_image(
             print(f"Using existing mesh: {mesh_path}")
             print("Pass --rebuild_mesh after changing image scale or camera intrinsics.")
 
+        # Render mesh preview with initial MaterialNet predictions
+        render_mesh_preview(mesh_path, camera_meta_path, output_dir, spp=64)
+
         if opt_env_from > 1:
             opt_envmap_path = os.path.join(output_dir, "best_results", "envmap.hdr")
             if os.path.exists(opt_envmap_path):
@@ -909,7 +948,7 @@ def inverse_image(
             "roughness": torch.from_numpy(opted_roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
             "metallic": torch.from_numpy(opted_metallic).unsqueeze(-1).cuda().clamp(0, 1),
             "normal": torch.from_numpy(opted_normal).cuda(),
-            "gt_image": torch.from_numpy(img_inverse).float().div(255.0).cuda(),
+            "gt_image": srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda(),
         }
 
     if "n" in str(opt_order):
@@ -1002,4 +1041,10 @@ def inverse_real(args):
 
 if __name__ == '__main__':
     args = parse_args()
-    inverse_real(args)
+    try:
+        inverse_real(args)
+    finally:
+        dr.sync_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
+        dr.flush_malloc_cache()
