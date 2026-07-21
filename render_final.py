@@ -16,21 +16,40 @@ import time
 dr.set_flag(dr.JitFlag.VCallRecord, False)
 dr.set_flag(dr.JitFlag.LoopRecord, False)
 
+import json
+
+def read_camera_meta(cam_cfg_path):
+    """Read FOV and film size from camera_meta.json. Fall back to 35°/512x512."""
+    try:
+        with open(cam_cfg_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        w, h = [int(v) for v in meta["film.size"]]
+        vfov = float(meta["y_fov"][0])
+        return vfov, w, h
+    except Exception:
+        return 35.0, 512, 512
+
 def load_estimated_mesh_w_env(mesh_path,env_path,use_mesh_normal=True,bsdf = {'name':'matbsdf'}):
     '''
     mat_dir: directory of estimated material
     '''
+    cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
+    # Try per-run camera_meta.json first
+    run_meta = os.path.join(os.path.dirname(mesh_path), "camera_meta.json")
+    if os.path.exists(run_meta):
+        cam_cfg_path = run_meta
+    vfov, film_w, film_h = read_camera_meta(cam_cfg_path)
     camera_cfg = {"type": "perspective",
-                "fov":35,
+                "fov": vfov,
+                "fov_axis": "y",
                 "to_world": mi.ScalarTransform4f.look_at(
                         origin=[0, 0, 0], target=[0, 0, -1], up=[0, 1, 0]),
                 "film": {
                 "type": "hdrfilm",
-                "width": 512,  # Viewport width in pixels
-                "height": 512,  # Viewport height in pixels
+                "width": film_w,
+                "height": film_h,
                 }}
     camera = mi.load_dict(camera_cfg)
-    cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
     # breakpoint()
     if bsdf['name'] == 'matbsdf' or bsdf['name'] == 'matDiffBSDF':
         bsdf_name = bsdf['name']
@@ -102,17 +121,23 @@ def load_estimated_mesh_w_env_insert(mesh_path,env_path,mat_dir,use_mesh_normal=
     mat_dir: directory of estimated material
     '''
     mi.register_bsdf("matbsdf", lambda props: matDiffBSDF(props))
+    cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
+    # Try per-run camera_meta.json first
+    run_meta = os.path.join(os.path.dirname(mesh_path), "camera_meta.json")
+    if os.path.exists(run_meta):
+        cam_cfg_path = run_meta
+    vfov, film_w, film_h = read_camera_meta(cam_cfg_path)
     camera_cfg = {"type": "perspective",
-                "fov":35,
+                "fov": vfov,
+                "fov_axis": "y",
                 "to_world": mi.ScalarTransform4f.look_at(
                         origin=[0, 0, 0], target=[0, 0, -1], up=[0, 1, 0]),
                 "film": {
                 "type": "hdrfilm",
-                "width": 512,  # Viewport width in pixels
-                "height": 512,  # Viewport height in pixels
+                "width": film_w,
+                "height": film_h,
                 }}
     camera = mi.load_dict(camera_cfg)
-    cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
     scene = mi.load_dict({
             'type': 'scene',
             'shape':{
@@ -158,9 +183,9 @@ def render_w_mi(mesh_path, env_path, save_name, n_iter=10, edit={'albedo':None,'
         use_mesh_normal = True
         print('Use Mesh Normal')
     scene = load_estimated_mesh_w_env(mesh_path,env_path,use_mesh_normal=use_mesh_normal,bsdf={'name':'matDiffBSDF'})
-    env_id = env_path.split('/')[-1][:-4]   
-    empty_img = np.zeros((512,512,3),dtype=np.float32)
-    denoiser = mi.OptixDenoiser(input_size=empty_img.shape[:2], albedo=False, normals=False, temporal=False)
+    env_id = env_path.split('/')[-1][:-4]
+    empty_img = None
+    denoiser = None
     mat = load_estimated_brdf(mat_dir)
     edit_flag = ''
     for key in edit.keys():
@@ -192,6 +217,9 @@ def render_w_mi(mesh_path, env_path, save_name, n_iter=10, edit={'albedo':None,'
     mi_params.update()
     for i in tqdm(range(n_iter)):
         img = mi.render(scene,spp=64,seed=i)
+        if denoiser is None:
+            denoiser = mi.OptixDenoiser(input_size=(img.shape[1], img.shape[0]), albedo=False, normals=False, temporal=False)
+            empty_img = np.zeros(img.numpy().shape, dtype=np.float32)
         img = denoiser(img)
         empty_img += img.numpy()
     img = empty_img/n_iter
@@ -212,8 +240,8 @@ def render_w_mi_insert(mesh_path, env_path, save_name, n_iter=10, input_path=Non
     
     scene = load_estimated_mesh_w_env_insert(mesh_path, env_path, mat_dir)
     env_id = env_path.split('/')[-1][:-4]
-    empty_img = np.zeros((512,512,3),dtype=np.float32)
-    denoiser = mi.OptixDenoiser(input_size=empty_img.shape[:2], albedo=False, normals=False, temporal=False)
+    empty_img = None
+    denoiser = None
     mat = load_estimated_brdf(mat_dir)
     mi_params = mi.traverse(scene)
     mi_params['shape.bsdf.a'] = mat['albedo']
@@ -225,6 +253,9 @@ def render_w_mi_insert(mesh_path, env_path, save_name, n_iter=10, input_path=Non
 
     for i in tqdm(range(n_iter)):
         img = mi.render(scene,spp=32,seed=i)
+        if denoiser is None:
+            denoiser = mi.OptixDenoiser(input_size=(img.shape[1], img.shape[0]), albedo=False, normals=False, temporal=False)
+            empty_img = np.zeros(img.numpy().shape, dtype=np.float32)
         img = denoiser(img)
         empty_img += img.numpy()
 
@@ -353,8 +384,8 @@ def render_rolling_envmap(save_name, env_path, frames, rotation_step, edit={'alb
         
         scene = load_estimated_mesh_w_env(mesh_path, temp_env_path, use_mesh_normal=use_mesh_normal, bsdf={'name':'matDiffBSDF'})
         
-        empty_img = np.zeros((512,512,3), dtype=np.float32)
-        denoiser = mi.OptixDenoiser(input_size=empty_img.shape[:2], albedo=False, normals=False, temporal=False)
+        empty_img = None
+        denoiser = None
         
         if input_path is not None:
             mat_dir = os.path.join(input_path, save_name, 'best_results')
@@ -389,6 +420,9 @@ def render_rolling_envmap(save_name, env_path, frames, rotation_step, edit={'alb
         
         for i in range(n_iter):
             img = mi.render(scene, spp=32, seed=i)
+            if denoiser is None:
+                denoiser = mi.OptixDenoiser(input_size=(img.shape[1], img.shape[0]), albedo=False, normals=False, temporal=False)
+                empty_img = np.zeros(img.numpy().shape, dtype=np.float32)
             img = denoiser(img)
             empty_img += img.numpy()
         
