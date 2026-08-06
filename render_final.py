@@ -120,7 +120,7 @@ def load_estimated_mesh_w_env_insert(mesh_path,env_path,mat_dir,use_mesh_normal=
     '''
     mat_dir: directory of estimated material
     '''
-    mi.register_bsdf("matbsdf", lambda props: matDiffBSDF(props))
+    mi.register_bsdf("matbsdf", lambda props: MatDiffBSDF(props))
     cam_cfg_path = os.path.join(global_config.BASE_DIR,"myutils", "default_cam.json")
     # Try per-run camera_meta.json first
     run_meta = os.path.join(os.path.dirname(mesh_path), "camera_meta.json")
@@ -148,12 +148,15 @@ def load_estimated_mesh_w_env_insert(mesh_path,env_path,mat_dir,use_mesh_normal=
             'insert_ply':{
                 'type': 'ply',
                 'filename': os.path.join(os.path.dirname(mat_dir), "oi.ply"),
-                'bsdf':{'type':'dielectric','int_ior': 'acrylic glass','ext_ior': 'air'},
+                # 'bsdf':{'type':'dielectric','int_ior': 'acrylic glass','ext_ior': 'air'},
+                # 'bsdf':{'type':'diffuse','reflectance': {'type': 'rgb','value':[0.8, 0.8, 0.8]}},
+                "bsdf": {"type": "roughplastic","alpha": 0.3,"int_ior": 1.49,"diffuse_reflectance": {"type": "rgb", "value": [0.8, 0.8, 0.8]}}
             },
             'insert_ply2':{
                 'type': 'ply',
                 'filename': os.path.join(os.path.dirname(mat_dir), "oi2.ply"),
-                'bsdf':{'type':'diffuse','reflectance': {'type': 'rgb','value':[0.8, 0.8, 0.8]}},
+                # 'bsdf':{'type':'diffuse','reflectance': {'type': 'rgb','value':[0.8, 0.8, 0.8]}},
+                "bsdf": {"type": "conductor","material": "Au","alpha": {"type": "rgb", "value": [0.02, 0.02, 0.02]}}
             },
             'integrator': {
                 'type': 'path',

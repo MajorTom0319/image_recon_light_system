@@ -7,18 +7,29 @@ reconstructs a mesh from the predicted depth, and renders the scene under a
 user-supplied HDRI using Mitsuba.
 
 Usage:
+# 单帧渲染
 python render_matnet_pre_with_hdri.py \
     --img_path  /home/majortom/project/test2.png \
     --matnet_dir /home/majortom/project/Materialist/output_imgs/test2_matnet_out \
-    --env_path  /home/majortom/project/Materialist/output_imgs/test2_syn_para/best_results/envmap.hdr
+    --env_path  /home/majortom/project/Materialist/output_imgs/test2_syn_para/best_results/envmap.hdr \
+    --mode single
+
+# 滚动渲染
+python render_matnet_pre_with_hdri.py \
+    --img_path /home/majortom/project/vin.jpg \
+    --matnet_dir /home/majortom/project/Materialist/output_imgs/vin_test_out1 \
+    --env_path /home/majortom/project/datasets/cowboy_town_saloon_4k.exr \
+    --mode rolling --frames 36 --rotation_step 10
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 
 import cv2
+import imageio
 import numpy as np
 import torch
 import open3d as o3d
@@ -41,6 +52,7 @@ from myutils.camera_utils import (
 )
 from myutils.mesh_recon import depth_file_to_mesh, rotate_mesh_around_x
 from myutils.misc import linear_to_srgb
+from torchvision.utils import save_image
 
 import global_config
 
@@ -51,8 +63,8 @@ import global_config
 def load_matnet_predictions(matnet_dir: str) -> dict:
     """Load albedo / roughness / metallic / normal / depth saved by test_matnet_infer.py."""
     albedo_path   = os.path.join(matnet_dir, "albedoPred.exr")
-    roughness_path = os.path.join(matnet_dir, "roughnessPred.png")
-    metallic_path  = os.path.join(matnet_dir, "metallicPred.png")
+    roughness_path = os.path.join(matnet_dir, "roughnessPred.exr")
+    metallic_path  = os.path.join(matnet_dir, "metallicPred.exr")
     normal_path    = os.path.join(matnet_dir, "normalPred.exr")
     depth_path     = os.path.join(matnet_dir, "depthPred.exr")
 
@@ -181,6 +193,80 @@ def render_scene(scene, mat: dict, use_mesh_normal: bool, spp: int = 64, n_iter:
 
 
 # ---------------------------------------------------------------------------
+# Rolling-envmap helpers
+# ---------------------------------------------------------------------------
+
+def rotate_envmap(envmap: np.ndarray, angle_degrees: float) -> np.ndarray:
+    """Circular-shift the envmap along the horizontal axis."""
+    height, width = envmap.shape[:2]
+    shift_pixels = int((angle_degrees / 360.0) * width)
+    rotated = np.zeros_like(envmap)
+    for c in range(envmap.shape[2]):
+        rotated[:, :, c] = np.roll(envmap[:, :, c], shift_pixels, axis=1)
+    return rotated
+
+
+def render_rolling(
+    mesh_path: str,
+    env_path: str,
+    cam_meta_path: str,
+    mat: dict,
+    use_mesh_normal: bool,
+    matnet_dir: str,
+    frames: int,
+    rotation_step: float,
+    spp: int,
+    n_iter: int,
+):
+    """Render a rolling-envmap animation: rotate the HDRI step-by-step."""
+    animation_dir = os.path.join(matnet_dir, "rolling_envmap_animation")
+    os.makedirs(animation_dir, exist_ok=True)
+
+    original_envmap = np.array(mi.Bitmap(env_path), dtype=np.float32)
+    env_id = os.path.splitext(os.path.basename(env_path))[0]
+
+    print(f"Generating {frames} frames, {rotation_step}° per frame")
+    frame_paths = []
+
+    for frame_idx in range(frames):
+        angle = frame_idx * rotation_step
+        rotated = rotate_envmap(original_envmap, angle)
+
+        temp_env = os.path.join(animation_dir, f"temp_envmap_{frame_idx}.hdr")
+        mi.Bitmap(rotated).write(temp_env)
+        while not os.path.exists(temp_env):
+            time.sleep(0.5)
+
+        print(f"  Frame {frame_idx + 1}/{frames}  (angle={angle:.1f}°)")
+
+        scene = build_scene(mesh_path, temp_env, cam_meta_path, use_mesh_normal)
+        img_linear = render_scene(scene, mat, use_mesh_normal, spp=spp, n_iter=n_iter)
+
+        img_srgb = linear_to_srgb(torch.from_numpy(img_linear)).clamp(0, 1)
+        frame_path = os.path.join(animation_dir, f"frame_{frame_idx:04d}.png")
+        save_image(img_srgb.permute(2, 0, 1), frame_path)
+        frame_paths.append(frame_path)
+
+        del scene
+        torch.cuda.empty_cache()
+        os.remove(temp_env)
+
+    # ── Assemble video ──────────────────────────────────────────────────────
+    mp4_path = os.path.join(matnet_dir, f"rolling_envmap_{env_id}.mp4")
+    img_list = [imageio.imread(p) for p in frame_paths]
+    imageio.mimwrite(mp4_path, img_list, format="mp4", fps=10, quality=8)
+    print(f"MP4 saved to: {mp4_path}")
+
+    gif_path = os.path.join(matnet_dir, f"rolling_envmap_{env_id}.gif")
+    with imageio.get_writer(gif_path, mode="I", duration=0.1) as writer:
+        for p in frame_paths:
+            writer.append_data(imageio.imread(p))
+    print(f"GIF saved to: {gif_path}")
+
+    return animation_dir
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -201,6 +287,12 @@ def parse_args():
                         help="Number of denoised render passes to accumulate.")
     parser.add_argument("--rebuild_mesh", action="store_true",
                         help="Force mesh rebuild even if PLY already exists.")
+    parser.add_argument("--mode", choices=["single", "rolling"], default="single",
+                        help="'single' = one render; 'rolling' = rotating HDRI animation.")
+    parser.add_argument("--frames", type=int, default=36,
+                        help="Number of frames for rolling animation.")
+    parser.add_argument("--rotation_step", type=float, default=10.0,
+                        help="Rotation angle per frame in degrees.")
     parser.add_argument("--use_mesh_normal", action="store_true", default=True,
                         help="Use mesh geometric normal (default). "
                              "Pass --no_mesh_normal to use MatNet predicted normal.")
@@ -232,6 +324,8 @@ def main():
 
     # ── 2. Load MatNet predictions ──────────────────────────────────────────
     mat = load_matnet_predictions(matnet_dir)
+    # mat["roughness"] = 0.7
+    # mat["metallic"] = 0
     work_h, work_w = int(mat["albedo"].shape[0]), int(mat["albedo"].shape[1])
     print(f"MatNet working resolution: {work_w} x {work_h}")
 
@@ -265,37 +359,51 @@ def main():
     mesh_path = os.path.join(matnet_dir, "mesh_hdri.ply")
     build_mesh(mat, K_work, mesh_path, rebuild=args.rebuild_mesh)
 
-    # ── 6. Build Mitsuba scene & render ─────────────────────────────────────
-    print(f"Building Mitsuba scene (HDRI: {env_path}) ...")
-    scene = build_scene(
-        mesh_path=mesh_path,
-        env_path=env_path,
-        cam_meta_path=cam_meta_path,
-        use_mesh_normal=args.use_mesh_normal,
-    )
+    # ── 6. Render (single or rolling) ──────────────────────────────────────
+    if args.mode == "rolling":
+        render_rolling(
+            mesh_path=mesh_path,
+            env_path=env_path,
+            cam_meta_path=cam_meta_path,
+            mat=mat,
+            use_mesh_normal=args.use_mesh_normal,
+            matnet_dir=matnet_dir,
+            frames=args.frames,
+            rotation_step=args.rotation_step,
+            spp=args.spp,
+            n_iter=args.n_iter,
+        )
+    else:
+        print(f"Building Mitsuba scene (HDRI: {env_path}) ...")
+        scene = build_scene(
+            mesh_path=mesh_path,
+            env_path=env_path,
+            cam_meta_path=cam_meta_path,
+            use_mesh_normal=args.use_mesh_normal,
+        )
 
-    print(f"Rendering (spp={args.spp}, n_iter={args.n_iter}) ...")
-    img_linear = render_scene(
-        scene, mat,
-        use_mesh_normal=args.use_mesh_normal,
-        spp=args.spp,
-        n_iter=args.n_iter,
-    )
+        print(f"Rendering (spp={args.spp}, n_iter={args.n_iter}) ...")
+        img_linear = render_scene(
+            scene, mat,
+            use_mesh_normal=args.use_mesh_normal,
+            spp=args.spp,
+            n_iter=args.n_iter,
+        )
 
-    # ── 7. Save results ─────────────────────────────────────────────────────
-    env_id   = os.path.splitext(os.path.basename(env_path))[0]
-    out_exr  = os.path.join(matnet_dir, f"render_{env_id}.exr")
-    out_png  = os.path.join(matnet_dir, f"render_{env_id}.png")
+        # ── 7. Save results ─────────────────────────────────────────────────
+        env_id   = os.path.splitext(os.path.basename(env_path))[0]
+        out_exr  = os.path.join(matnet_dir, f"render_{env_id}.exr")
+        out_png  = os.path.join(matnet_dir, f"render_{env_id}.png")
 
-    mi.util.write_bitmap(out_exr, img_linear)
+        mi.util.write_bitmap(out_exr, img_linear)
 
-    img_srgb  = linear_to_srgb(torch.from_numpy(img_linear)).clamp(0, 1)
-    img_srgb_np = (img_srgb.numpy() * 255).astype(np.uint8)
-    img_bgr   = cv2.cvtColor(img_srgb_np, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(out_png, img_bgr)
+        img_srgb  = linear_to_srgb(torch.from_numpy(img_linear)).clamp(0, 1)
+        img_srgb_np = (img_srgb.numpy() * 255).astype(np.uint8)
+        img_bgr   = cv2.cvtColor(img_srgb_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(out_png, img_bgr)
 
-    print(f"EXR saved to: {out_exr}")
-    print(f"PNG saved to: {out_png}")
+        print(f"EXR saved to: {out_exr}")
+        print(f"PNG saved to: {out_png}")
 
 
 if __name__ == "__main__":

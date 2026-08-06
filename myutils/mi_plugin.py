@@ -25,6 +25,11 @@ if os.environ.get('MATERIALIST_DRJIT_DEBUG', '0') == '1':
     torch.autograd.set_detect_anomaly(True)
 warnings.simplefilter('once', UserWarning)
 import math
+
+# MATERIALIST_FIREFLY_CLAMP: upper bound for the per-sample BSDF weight (brdf/pdf)
+# in MatDiffBSDF importance sampling. Low-roughness GGX at grazing half-angles makes
+# this weight blow up (-> dense white fireflies). Tune via env var; 0 disables clamp.
+MATDIFF_BSDF_WEIGHT_CLAMP = float(os.environ.get('MATERIALIST_BSDF_WEIGHT_CLAMP', '10.0'))
 # dr.set_flag(dr.JitFlag.VCallRecord, False)
 # dr.set_flag(dr.JitFlag.LoopRecord, False)
 
@@ -1403,6 +1408,7 @@ class MatDiffBSDF(mi.BSDF):
             mi.BSDFFlags.SpatiallyVarying
             | mi.BSDFFlags.DiffuseReflection
             | mi.BSDFFlags.FrontSide
+            | mi.BSDFFlags.BackSide
         )
         self.m_components = [self.m_flags]
         self.use_mesh_normal = (
@@ -1556,6 +1562,11 @@ class MatDiffBSDF(mi.BSDF):
         # brdf_weight = dr.select(pdf > 1e-6, brdf / pdf, mi.Vector3f(0.0))
         brdf_weight = brdf / (pdf+1e-6)
         brdf_weight = dr.select(pdf > 1e-6, brdf_weight, mi.Vector3f(0.0))
+        # MATERIALIST_FIREFLY_CLAMP: low-roughness GGX at grazing half-angles makes
+        # brdf/pdf (= G*F*VoH/NoH) blow up to hundreds/thousands -> dense white
+        # fireflies in the path tracer. Clamp the per-sample weight to remove them.
+        if MATDIFF_BSDF_WEIGHT_CLAMP > 0:
+            brdf_weight = dr.minimum(brdf_weight, mi.Vector3f(MATDIFF_BSDF_WEIGHT_CLAMP))
         pdf = dr.select(pdf > 0, pdf, mi.Float(0.0))
         return wi, pdf, brdf_weight
 
@@ -1622,12 +1633,12 @@ class MatDiffBSDF(mi.BSDF):
             F_D90 = 0.5 + 2 * VoH ** 2 * roughness
             F_D_w_out = 1 + (F_D90 - 1) * (1 - NoV) ** 5
             F_D_w_in = 1 + (F_D90 - 1) * (1 - NoL) ** 5
-            brdf_diff = baseColor_d / math.pi * F_D_w_out * F_D_w_in * NoL
+            brdf_diff = baseColor_d / math.pi * F_D_w_out * F_D_w_in
 
             G = G_Smith(NoV, NoL, roughness)
             C_0 = (1 - metallic) * 0.04 + metallic * albedo
             F_m = C_0 + (1 - C_0) * (1 - VoH) ** 5
-            brdf_metal = D * G  * F_m / 4 * NoL
+            brdf_metal = D * G  * F_m / 4
             brdf = brdf_diff + brdf_metal
         else:
             # get brdf
@@ -1637,8 +1648,8 @@ class MatDiffBSDF(mi.BSDF):
 
             G = G_Smith(NoV, NoL, roughness)
             F = fresnelSchlick(VoH, ks)
-            brdf_diff = kd / math.pi * NoL
-            brdf_spec = D * G * F / 4.0 * NoL
+            brdf_diff = kd / math.pi
+            brdf_spec = D * G * F / 4.0
             brdf = brdf_diff + brdf_spec
         return brdf, pdf
 

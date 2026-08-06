@@ -7,8 +7,17 @@ import mitsuba as mi
 
 import open3d as o3d
 from myutils.mesh_recon import depth_file_to_mesh,rotate_mesh_around_x
+from myutils.camera_utils import (
+    attach_infer_image_scaled,
+    estimate_camera_geocalib,
+    make_mitsuba_compatible_K,
+    scale_intrinsics,
+    write_materialist_camera_json,
+)
 import matplotlib.pyplot as plt
 import numpy as np
+
+attach_infer_image_scaled(MaterialNet)
 
 def main() -> None:
     image_path = "/home/majortom/project/datasets/interiorverse1/000_im.exr"
@@ -74,8 +83,43 @@ def main() -> None:
     print(meta)
 
     import os 
-    test_output = "/home/majortom/project/Materialist/output_imgs/interiorverse1"
+    test_output = "/home/majortom/project/Materialist/output_imgs/interiorverse1_geocalib"
     os.makedirs(test_output, exist_ok=True)
+
+    # ---- GeoCalib 估计相机内参 ----
+    original_h, original_w = image_rgb_original.shape[:2]
+    # GeoCalib 的 load_image 不支持 EXR，需转为 8-bit PNG 临时文件
+    if image_path.lower().endswith(".exr"):
+        img_for_geo = np.clip(image_rgb * 255, 0, 255).astype(np.uint8)
+        geo_input_path = os.path.join(test_output, "_geo_input.png")
+        cv2.imwrite(geo_input_path, cv2.cvtColor(img_for_geo, cv2.COLOR_RGB2BGR))
+    else:
+        geo_input_path = image_path
+
+    geo_camera = estimate_camera_geocalib(geo_input_path, device="cuda")
+    print(f"GeoCalib: hfov={geo_camera.hfov_deg:.2f}, vfov={geo_camera.vfov_deg:.2f}, "
+          f"fx={geo_camera.K[0,0]:.1f}, fy={geo_camera.K[1,1]:.1f}")
+
+    # 将原始分辨率的 K 缩放到 MatNet 工作分辨率
+    work_h, work_w = pred['albedo'].shape[:2]
+    K_work = scale_intrinsics(
+        geo_camera.K,
+        source_hw=(original_h, original_w),
+        target_hw=(work_h, work_w),
+        preprocess_meta=meta,
+    )
+    K_work = make_mitsuba_compatible_K(K_work)
+
+    # 保存 camera_meta.json 供后续渲染/优化使用
+    camera_meta_path = os.path.join(test_output, "camera_meta.json")
+    write_materialist_camera_json(
+        camera_meta_path,
+        K_work=K_work,
+        work_hw=(work_h, work_w),
+        geocalib_result=geo_camera,
+        preprocess_meta=meta,
+    )
+    print(f"Camera meta saved: {camera_meta_path} (work={work_w}x{work_h})")
     # 保存普通显示图。
     albedo_bgr = cv2.cvtColor(
         (pred["albedo"].clip(0, 1) * 255).astype("uint8"),
@@ -150,17 +194,8 @@ def main() -> None:
         if os.path.exists(mesh_mask_path):
             depth[mesh_mask] = 0
             print(f"Applied mask from {mesh_mask_path} to depth map")
-        # Build camera intrinsic matching the depth map size
-        import math
-        dh, dw = depth.shape[:2]
-        fov_deg = 35.0
-        focal = (dw / 2) / math.tan(math.radians(fov_deg) / 2)
-        cam = o3d.camera.PinholeCameraIntrinsic(
-            width=dw, height=dh,
-            fx=focal, fy=focal,
-            cx=(dw - 1) / 2.0, cy=(dh - 1) / 2.0,
-        )
-        mesh, b_points  = depth_file_to_mesh(depth,cameraMatrix=cam, minAngle=6, sun3d=False, depthScale=1.0)
+        # 使用 GeoCalib 估计的相机内参构建 mesh
+        mesh, b_points = depth_file_to_mesh(depth, cameraMatrix=K_work, minAngle=6, sun3d=False, depthScale=1.0)
         mesh = rotate_mesh_around_x(mesh, 180)
         o3d.io.write_triangle_mesh(mesh_path, mesh)
 
