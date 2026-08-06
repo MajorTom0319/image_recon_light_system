@@ -12,7 +12,6 @@ import math
 from pathlib import Path
 from typing import Any, Mapping
 
-import cv2
 import numpy as np
 import torch
 
@@ -214,63 +213,6 @@ def estimate_camera_geocalib(
         focal_uncertainty_px=focal_uncertainty,
         extra={"pose_used": False, "camera_model": "pinhole"},
     )
-
-
-def attach_infer_image_scaled(material_net_class: type) -> None:
-    """Install the aspect-ratio-preserving inference wrapper used by this integration."""
-
-    @torch.no_grad()
-    def infer_image_scaled(
-        self,
-        raw_image: np.ndarray,
-        scale: float = 0.5,
-        input_size: int = 518,
-    ):
-        if not isinstance(raw_image, np.ndarray) or raw_image.ndim != 3:
-            raise TypeError("raw_image must be an HxWxC numpy array")
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("scale must be a finite positive number")
-
-        original_h, original_w = raw_image.shape[:2]
-        work_h = max(1, int(round(original_h * scale)))
-        work_w = max(1, int(round(original_w * scale)))
-        interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_CUBIC
-        work_image = cv2.resize(raw_image, (work_w, work_h), interpolation=interpolation)
-        pred_mat = self.infer_image(work_image, input_size=input_size)
-
-        # MaterialNet versions differ slightly in their output resize behavior.
-        # Enforce one common HxW for every spatial prediction.
-        resized_pred = {}
-        for key, value in pred_mat.items():
-            array = np.asarray(value)
-            if array.ndim >= 2 and array.shape[:2] != (work_h, work_w):
-                array = cv2.resize(
-                    array,
-                    (work_w, work_h),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            resized_pred[key] = array
-        pred_mat = resized_pred
-
-        sx = work_w / float(original_w)
-        sy = work_h / float(original_h)
-        pixel_transform = np.array(
-            [[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]],
-            dtype=np.float32,
-        )
-        meta = {
-            "original_size": [int(original_w), int(original_h)],
-            "work_size": [int(work_w), int(work_h)],
-            "crop_box": [0, 0, int(original_w), int(original_h)],
-            "scale_x": float(sx),
-            "scale_y": float(sy),
-            "pixel_transform": pixel_transform.tolist(),
-            "network_size": int(input_size),
-            "center_crop": False,
-        }
-        return pred_mat, work_image, meta
-
-    setattr(material_net_class, "infer_image_scaled", infer_image_scaled)
 
 
 def scale_intrinsics(
