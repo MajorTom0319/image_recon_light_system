@@ -46,11 +46,11 @@ Materialist 负责场景几何和 BRDF，IndoorLightEditing 作为显式灯光 p
 
 | 文件 | 功能 |
 | --- | --- |
-| `myutils/moge2_utils.py` | MoGe2 模型加载、有限值/mask 清理、mesh depth 和稠密 depth 准备 |
-| `test_matnet_infer_moge2.py` | 联合检查 MatNet、MoGe2、相机、材质和 mesh，并输出 ILE 所需的 `depth.npy` |
-| `Material_net/dpt.py` | 唯一的 `infer_image_scaled()` 实现，统一 scale、宽高比和 patch padding 语义 |
+| `myutils/moge2_utils.py` | MoGe2 模型加载、mask-aware depth/points/normal resize，以及 camera → Materialist 坐标变换 |
+| `test_matnet_infer_moge2.py` | 联合生成 MatNet 材质、MoGe2 几何、正确颜色空间 GT、强制重建 mesh、有效 mask、manifest 和 ILE `depth.npy` |
+| `Material_net/dpt.py` | 唯一的 `infer_image_scaled()` 实现，统一 scale、宽高比和 patch padding；float HDR 不再被按 255 静默缩放 |
 
-mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定；IndoorLightEditing 的 `depth.npy` 则会用最近有效深度补齐，避免零深度参与反投影。
+mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定，mesh builder 会保证这些点不被三角形引用；IndoorLightEditing 的 `depth.npy` 则会用最近有效深度补齐，避免零深度参与反投影。`moge2_normal.exr` / `moge2_points.exr` 已转换到 Materialist 坐标，原始 MoGe camera-space 数据另存为 `*_camera.exr`。
 
 ### Hybrid 显式灯光桥接
 

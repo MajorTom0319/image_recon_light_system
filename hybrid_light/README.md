@@ -10,6 +10,23 @@ The first version supports visible and invisible **lamps**. ILE windows are
 reported but deliberately ignored because their sun/sky/ground lobes cannot be
 faithfully represented by a uniform area emitter.
 
+Prepare a consistent Materialist scene and IndoorLightEditing depth first:
+
+```bash
+/home/majortom/miniconda3/envs/materialist5090/bin/python \
+  test_matnet_infer_moge2.py \
+  --image-path /home/majortom/project/IndoorLightEditing/examples/Example1/input/im.png \
+  --output-dir output_imgs/indoorlightediting_test1 \
+  --scale 1
+```
+
+This command treats PNG/JPG as sRGB, writes a linear `gt_image.exr`, preserves
+an exact display-color `gt_image.png`, and rebuilds the mesh every run. It also
+exports validity masks, camera-space and Materialist-space MoGe vectors,
+`mesh_depth.exr`, and `inference_manifest.json`. `moge2_normal.exr` and
+`moge2_points.exr` use Materialist's `+X right, +Y up, -Z forward` convention;
+their `*_camera.exr` counterparts retain the raw MoGe camera convention.
+
 Run a validation pass first:
 
 ```bash
@@ -59,7 +76,9 @@ Stage B constrains each emitter to
 `optimized_rgb = ILE_RGB * scalar_scale`. Its loss combines display-space
 Charbonnier, MSE, and a `log(scale)` prior. Stage C keeps those optimized lamps
 fixed and optimizes an HxW tensor of `(16, 32, 3)` with non-negativity, energy,
-and spherical horizontal-wrap TV regularization.
+and spherical horizontal-wrap TV regularization. Unless `--target` is passed,
+this entry now uses the original image recorded by the ILE JSON instead of a
+possibly stale legacy `gt_image.exr`.
 
 The default output directory is `hybrid_ile_farfield_opt/`. Important outputs
 include `stage_b_lamps.json`, both optimization histories, optimized local and

@@ -127,8 +127,6 @@ def detect_boundary_points(depth, camera=DEFAULT_CAMERA, minAngle=3.0):
         -1,
         dtype=np.int32,
     )
-    refer_map_x *= -1
-    refer_map_y *= -1
     cam_coords = K_inv @ pixel_coords * depth.flatten()
     boundary_points = []
     copy_coords = []
@@ -185,7 +183,10 @@ def detect_boundary_points(depth, camera=DEFAULT_CAMERA, minAngle=3.0):
                 refer_map_y[i, j] = refer_idx_y
                 pbar.update(1)
 
-    new_depth = depth
+    # Keep zero-depth/masked pixels invalid. ``-1`` above is the no-reference
+    # sentinel; multiplying it by -1 used to turn it into ``+1`` and caused a
+    # skipped invalid pixel to inherit depth from pixel (1, 1).
+    new_depth = depth.copy()
     count = 0
     # Modify depth
     with tqdm(total=(h - 1) * (w - 1),desc='Modify depth',file=sys.stdout) as pbar:

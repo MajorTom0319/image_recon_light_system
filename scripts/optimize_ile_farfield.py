@@ -571,11 +571,15 @@ def main() -> None:
 
     mi.register_bsdf("MatDiffBSDF", lambda props: MatDiffBSDF(props))
     material_arrays = _load_material_arrays(mi, material_paths, (height, width))
-    target_path = (
-        args.target.expanduser().resolve()
-        if args.target is not None
-        else materialist_dir / "gt_image.exr"
-    )
+    if args.target is not None:
+        target_path = args.target.expanduser().resolve()
+        target_source = "explicit_cli"
+    elif light_set.image_path is not None and light_set.image_path.is_file():
+        target_path = light_set.image_path.resolve()
+        target_source = "ile_original_image"
+    else:
+        target_path = (materialist_dir / "gt_image.exr").resolve()
+        target_source = "materialist_gt_fallback"
     if not target_path.is_file():
         raise FileNotFoundError(target_path)
     target_linear = load_target_linear(mi, target_path, (height, width))
@@ -657,6 +661,10 @@ def main() -> None:
         "mesh": str(mesh_path),
         "camera_meta": str(camera_path),
         "target": str(target_path),
+        "target_source": target_source,
+        "target_color_space": (
+            "linear" if target_path.suffix.lower() in {".exr", ".hdr"} else "srgb"
+        ),
         "lights_json": str(light_set.source_path),
         "materials": {key: str(value) for key, value in material_paths.items()},
         "geometry_scale": light_set.metadata["geometry_scale"],

@@ -25,10 +25,10 @@ Materialist mesh + Materialist BRDF + ILE lamps
 | --- | --- | --- |
 | MatNet 材质预测 | 已完成重构 | 仓库内统一使用一套 `infer_image_scaled()`；scale、宽高比、patch padding 和输出尺寸语义明确 |
 | MoGe2 相机与几何 | 已集成 | 输出 metric depth、normal、points、有效 mask 和相机 K |
-| MoGe 无效值处理 | 已完成 | mask 外以及 `NaN/Inf/非正` 深度不会进入 mesh；resize 使用 mask-aware 插值 |
+| MoGe 无效值处理 | 已完成 | mask 外以及 `NaN/Inf/非正` 深度不会进入 mesh；depth/points/normal resize 均使用 mask-aware 插值 |
 | ILE depth 输入 | 已完成 | 输出原图尺寸、稠密、有限、正值的 `float32 depth.npy`，与 mesh 使用相同的 MoGe depth source |
-| Mesh 重建 | 已集成 | 使用工作分辨率 K 和 metric depth，支持 `mesh_mask` 与强制重建 |
-| 相机元数据 | 已集成 | `camera_meta.json` 由 mesh、Mitsuba sensor 和 Materialist BSDF 共用 |
+| Mesh 重建 | 已集成 | 使用工作分辨率 K 和 metric depth，每次推理强制重建；0-depth/mask sentinel 已修复 |
+| 相机元数据 | 已集成 | `camera_meta.json` 由 mesh、Mitsuba sensor 和 Materialist BSDF 共用，并正确记录 MoGe2/GeoCalib 来源 |
 | ILE 灯光 JSON/OBJ | 已接入 | 解析 visible/invisible lamp center、RGB、geometry 和可选 depth scale |
 | ILE → Mitsuba 灯光 | Prototype 已跑通 | lamp OBJ 作为 Mitsuba area emitter 加载；window 暂不接入 |
 | Hybrid 渲染入口 | 已实现 | 支持 `local`、`env`、`combined`、dry-run 和 visible/invisible 消融 |
@@ -38,7 +38,7 @@ Materialist mesh + Materialist BRDF + ILE lamps
 | 32×16 far-field HDRI | 主流程已实现 | 固定 Stage B 局部灯，优化非负低频 envmap，并加入能量和球面 TV 正则 |
 | 固定灯光下的 ARM refinement | 主流程已实现 | 可跳过 Stage B，先优化 HDRI，再固定全部光照优化输入 albedo/roughness/metallic |
 | Local + far-field 联合 refinement | 待实现 | 当前采用分阶段冻结策略，尚未进行最后的小步联合优化 |
-| 自动化测试 | 初步建立 | Hybrid 已有 5 个坐标/尺度/JSON 测试，其他模块仍需系统化 |
+| 自动化测试 | 初步建立 | 已有 14 个颜色、HDR、坐标、mask、mesh、尺度和 JSON 回归测试 |
 
 ## 已完成实现
 
@@ -47,7 +47,8 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - `myutils/moge2_utils.py` 集中处理模型加载、推理和深度准备。
 - MoGe2 采用 `apply_mask=False`，有效性由独立 mask 管理，避免默认的 `inf` 深度污染下游。
 - mesh depth 的无效区域保持为 0；缩放时无效值不会参与有效深度插值。
-- MoGe2 depth、points 和 normal 在导出前均进行有限值检查。
+- `depth_file_to_mesh()` 的 `-1` sentinel 初始化错误已修复，0-depth/mask 像素不会再从 `(1,1)` 错误继承深度。
+- MoGe2 depth、points 和 normal 在导出前均进行有限值检查；points/normal 同时输出原始 camera-space 与经过 `Rx(180°)` 的 Materialist-space 版本。
 
 ### 2. MatNet 工作分辨率统一
 
@@ -55,13 +56,16 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - `scale` 会真实控制 MatNet 工作尺寸，而不只是后处理输出大小。
 - 网络输入自动 padding 到 ViT patch size，输出裁回工作尺寸。
 - normal 输出重新单位化，相机 K 使用相同的 pixel transform 映射。
+- MatNet 明确使用线性 RGB；8/16-bit 普通图像先按 sRGB 解码，float HDR 保留真实辐射值，不再根据最大值静默除以 255。
+- GT、材质、MoGe maps、K 与 mesh 全部使用同一 work resolution；albedo PNG 使用正确显示 gamma，材质 EXR 写出前执行物理范围约束。
 
 ### 3. IndoorLightEditing 深度适配
 
-- `test_matnet_infer_moge2.py` 在 MoGe 推理完成后立即输出 ILE 使用的 `depth.npy`。
+- `test_matnet_infer_moge2.py` 在完整推理和 mesh 重建成功后输出 ILE 使用的 `depth.npy`。
 - 输出严格为原图 `(H, W)`、`float32`、有限正值 metric depth。
 - MoGe 无效像素使用最近有效深度补齐，避免 ILE 反投影出现零深度几何。
 - ILE 和 Materialist mesh 当前使用同一份 MoGe metric depth，减少尺度及结构漂移。
+- 输出 `moge2_valid_mask.*`、`mesh_valid_mask.png`、`mesh_depth.exr` 和 `inference_manifest.json`，防止不同运行版本的 GT、K、depth 与 mesh 静默混用。
 
 ### 4. Hybrid light bridge
 
@@ -110,12 +114,15 @@ Materialist mesh + Materialist BRDF + ILE lamps
 ### 数值与接口验证
 
 - 本次新增优化入口已通过 `py_compile`；本次维护的入口与文档已通过定向 `git diff --check`。
-- Hybrid 的 5 个单元测试全部通过：
+- 颜色、MoGe、mesh 与 Hybrid 的 14 个单元测试全部通过，其中包括：
   - 相机中心投影；
   - `+X` 投向图像右侧；
   - `+Y` 投向图像上方；
   - 3D→2D→3D round-trip；
   - depth scale 和 JSON 读取。
+- 8-bit/16-bit PNG sRGB→linear→PNG 往返、float HDR 不除以 255、非透明 alpha 拒绝策略均已验证。
+- MoGe normal/points 的 `Rx(180°)` 坐标变换、mask-aware resize 和 normal 单位化均已验证。
+- 0-depth synthetic case 已验证不会被 mesh 三角形引用。
 - MoGe depth 已验证 `NaN/Inf/非正值/mask` 清理及不同尺寸下的传播。
 - MatNet 已验证 `scale=1`、`scale=0.5`、输出尺寸、normal 长度和 K 缩放。
 
@@ -125,6 +132,9 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - ILE 当前假设水平 FOV：57.95°。
 - visible lamp center 投影与 lamp mask 中心误差：约 0.63 px。
 - 当前 ILE 未对 MoGe depth 进行 normalization，因此 geometry scale 为 1。
+- Example1 已于 2026-08-10 全量重建：`gt_image.exr` 与原图标准 linear RGB 完全一致，`gt_image.png` 与原 PNG 逐像素一致。
+- 重建后的 albedo/roughness/metallic 全部有限并处于合法范围；MoGe camera/materialist vector 变换误差为 0，mesh 重投影最大误差小于 `1e-12 px`。
+- 修正后的 MoGe predicted normal 已通过独立 2 spp Mitsuba smoke render：输出全有限、非黑屏，约 53.5% 像素在该低采样下获得非零 local-light contribution。
 - 成功加载 1 个 visible lamp 和 1 个 invisible lamp。
 - local-only、visible-only、invisible-only 均得到有效非空照明。
 - 64 spp local-only raw EXR 全部为有限值，约 98.6% 像素获得非零贡献。

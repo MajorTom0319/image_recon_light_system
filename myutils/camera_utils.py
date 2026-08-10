@@ -211,7 +211,7 @@ def estimate_camera_geocalib(
         hfov_deg=hfov_deg,
         vfov_deg=vfov_deg,
         focal_uncertainty_px=focal_uncertainty,
-        extra={"pose_used": False, "camera_model": "pinhole"},
+        extra={"pose_used": False, "camera_model": "pinhole", "source": "geocalib"},
     )
 
 
@@ -294,12 +294,13 @@ def write_materialist_camera_json(
     K_work = make_mitsuba_compatible_K(K_work)
     hfov_deg, vfov_deg = _fovs_from_K(K_work, width=work_w, height=work_h)
 
+    camera_source = str(geocalib_result.extra.get("source", "geocalib"))
     meta: dict[str, Any] = {
-        "schema": "materialist_geocalib_intrinsics_v1",
+        "schema": "materialist_intrinsics_v2",
         "camera_model": "pinhole",
-        "camera_source": "geocalib_intrinsics_only",
+        "camera_source": f"{camera_source}_intrinsics_only",
         "pose_source": "materialist_fixed",
-        "pose_used_from_geocalib": False,
+        "pose_used_from_estimator": False,
         "film.size": [work_w, work_h],
         "film.crop_size": [work_w, work_h],
         "film.crop_offset": [0, 0],
@@ -314,7 +315,7 @@ def write_materialist_camera_json(
         "to_world": [_SENSOR_TO_WORLD.tolist()],
         "roll_deg": 0.0,
         "pitch_deg": 0.0,
-        "geocalib_reported_roll_pitch_ignored": True,
+        "reported_roll_pitch_ignored": True,
         "original_size": [int(geocalib_result.width), int(geocalib_result.height)],
         "work_size": [work_w, work_h],
     }

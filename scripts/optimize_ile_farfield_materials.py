@@ -12,6 +12,7 @@ optimization used in ``inverse_img_w_mi_ori.py``.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 from typing import Any
@@ -232,15 +233,32 @@ def mean_abs_dr(dr, value):
 
 
 def resolve_target_path(args, light_set, materialist_dir: Path) -> tuple[Path, str]:
-    """Prefer the original ILE input over legacy Materialist target exports.
+    """Use a verified current GT, while avoiding legacy mislabeled EXRs.
 
     Older ``gt_image.exr`` files can contain sRGB PNG values mislabeled as
-    linear EXR. The ILE JSON retains the original image path, whose extension
-    lets ``load_target_linear()`` apply the correct transfer function.
+    linear EXR. Inference manifest v2 guarantees the corrected linear export
+    at the same working resolution as the geometry and material maps.
     """
     if args.target is not None:
         path = args.target.expanduser().resolve()
         source = "explicit_cli"
+    elif (materialist_dir / "inference_manifest.json").is_file():
+        manifest = json.loads(
+            (materialist_dir / "inference_manifest.json").read_text(encoding="utf-8")
+        )
+        gt_path = (materialist_dir / "gt_image.exr").resolve()
+        if (
+            manifest.get("schema_version", 0) >= 2
+            and manifest.get("status") == "complete"
+        ):
+            path = gt_path
+            source = "verified_materialist_gt"
+        elif light_set.image_path is not None and light_set.image_path.is_file():
+            path = light_set.image_path.resolve()
+            source = "ile_original_image"
+        else:
+            path = gt_path
+            source = "materialist_gt_fallback"
     elif light_set.image_path is not None and light_set.image_path.is_file():
         path = light_set.image_path.resolve()
         source = "ile_original_image"

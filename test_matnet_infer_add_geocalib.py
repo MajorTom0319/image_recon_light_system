@@ -8,7 +8,6 @@ import mitsuba as mi
 import open3d as o3d
 from myutils.mesh_recon import depth_file_to_mesh,rotate_mesh_around_x
 from myutils.camera_utils import (
-    attach_infer_image_scaled,
     estimate_camera_geocalib,
     make_mitsuba_compatible_K,
     scale_intrinsics,
@@ -16,8 +15,6 @@ from myutils.camera_utils import (
 )
 import matplotlib.pyplot as plt
 import numpy as np
-
-attach_infer_image_scaled(MaterialNet)
 
 def main() -> None:
     image_path = "/home/majortom/project/datasets/interiorverse1/000_im.exr"

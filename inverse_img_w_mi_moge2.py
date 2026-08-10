@@ -4,12 +4,12 @@ from myutils.mi_plugin import MatDiffBSDF
 from huggingface_hub import hf_hub_download
 from Material_net.dpt import MaterialNet
 from myutils.camera_utils import (
-    estimate_camera_geocalib,
-    make_fixed35_camera,
     make_mitsuba_compatible_K,
     scale_intrinsics,
     write_materialist_camera_json,
 )
+from myutils.moge2_utils import estimate_camera_moge2, prepare_moge2_depth
+from myutils.mesh_recon import depth_file_to_mesh, rotate_mesh_around_x
 mi.register_bsdf('MatDiffBSDF', lambda props: MatDiffBSDF(props))
 import global_config
 from torchvision.utils import save_image,make_grid
@@ -18,7 +18,6 @@ import gc
 from myutils.misc import *
 from mymodels.mlps import PosMLP
 from myutils.envmap_utils import lookup_envmap, importance_sample, build_envmap,sample_brdf1,sample_env1
-from myutils.mesh_recon import depth_file_to_mesh,rotate_mesh_around_x
 import open3d as o3d
 import argparse
 import torch.nn.functional as NF
@@ -33,7 +32,191 @@ import imageio
 import os
 import cv2
 
-# from render_final import load_estimated_mesh_w_env
+def _depth_edge_mask(depth: np.ndarray, mask: np.ndarray, rtol: float = 0.04) -> np.ndarray:
+    """Detect depth discontinuity edges (similar to MoGe2's depth_map_edge).
+    
+    Returns a boolean mask where True = edge pixel to be removed.
+    """
+    h, w = depth.shape
+    edge_mask = np.zeros((h, w), dtype=bool)
+    
+    # Compute disparity
+    disp = np.where(mask & (depth > 0), 1.0 / np.clip(depth, 1e-8, None), 0.0)
+    
+    # Check 4-neighbors for depth discontinuity
+    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        ny = np.clip(np.arange(h) + dy, 0, h - 1)
+        nx = np.clip(np.arange(w) + dx, 0, w - 1)
+        neighbor_disp = disp[ny[:, None], nx[None, :]]
+        # Relative depth difference
+        diff = np.abs(disp - neighbor_disp)
+        max_disp = np.maximum(np.abs(disp), np.abs(neighbor_disp))
+        edge = mask & (diff > rtol * max_disp) & (max_disp > 0)
+        edge_mask |= edge
+    
+    # Dilate edge mask by 1 pixel
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    edge_mask = cv2.dilate(edge_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    return edge_mask
+
+
+def build_mesh_from_moge2_points(
+    points: np.ndarray,
+    mask: np.ndarray,
+    depth: np.ndarray,
+    mesh_mask: np.ndarray = None,
+    edge_threshold: float = 0.04,
+) -> o3d.geometry.TriangleMesh:
+    """Build a triangle mesh directly from MoGe2's point map.
+    
+    This replicates MoGe2's `infer --ply` mesh building logic:
+    1. Remove edge pixels at depth discontinuities
+    2. Triangulate the regular grid
+    3. Convert from OpenCV coords (Y-down, Z-forward) to Mitsuba coords (Y-up, Z-backward)
+    
+    Args:
+        points: (H, W, 3) point map in OpenCV camera coordinate system
+        mask: (H, W) boolean valid pixel mask from MoGe2
+        depth: (H, W) depth map for edge detection
+        mesh_mask: optional (H, W) boolean mask from user (True = exclude)
+        edge_threshold: relative threshold for depth edge removal
+        
+    Returns:
+        open3d TriangleMesh in Mitsuba coordinate system
+    """
+    h, w = points.shape[:2]
+    
+    # Clean mask: remove edge pixels at depth discontinuities
+    edge_mask = _depth_edge_mask(depth, mask, rtol=edge_threshold)
+    mask_cleaned = mask & ~edge_mask
+    
+    # Apply user-provided mesh_mask (True = pixels to exclude)
+    if mesh_mask is not None:
+        if mesh_mask.shape[:2] != (h, w):
+            mesh_mask = cv2.resize(mesh_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        mask_cleaned = mask_cleaned & ~mesh_mask
+        print(f"Applied user mesh_mask, excluded {mesh_mask.sum()} pixels")
+    
+    print(f"Mesh building: {mask_cleaned.sum()} valid pixels out of {h*w} total "
+          f"(removed {edge_mask.sum()} edge pixels)")
+    
+    # Build vertex index map: assign sequential indices to valid pixels
+    valid_indices = np.full((h, w), -1, dtype=np.int32)
+    valid_indices[mask_cleaned] = np.arange(mask_cleaned.sum(), dtype=np.int32)
+    
+    # Get vertex positions from point map
+    vertices = points[mask_cleaned]  # (N, 3) in OpenCV coords
+    
+    # Build triangles from grid quads (vectorized)
+    # For each (i, j) cell, check the 4 corners
+    tl = valid_indices[:-1, :-1]  # (H-1, W-1)
+    tr = valid_indices[:-1, 1:]   # (H-1, W-1)
+    bl = valid_indices[1:, :-1]   # (H-1, W-1)
+    br = valid_indices[1:, 1:]    # (H-1, W-1)
+    
+    # Triangle 1: top-left, bottom-left, top-right (where all 3 are valid)
+    valid_tri1 = (tl >= 0) & (bl >= 0) & (tr >= 0)
+    tri1 = np.stack([tl[valid_tri1], bl[valid_tri1], tr[valid_tri1]], axis=-1)
+    
+    # Triangle 2: top-right, bottom-left, bottom-right (where all 3 are valid)
+    valid_tri2 = (tr >= 0) & (bl >= 0) & (br >= 0)
+    tri2 = np.stack([tr[valid_tri2], bl[valid_tri2], br[valid_tri2]], axis=-1)
+    
+    # Combine all triangles
+    tri_list = [t for t in [tri1, tri2] if len(t) > 0]
+    if tri_list:
+        triangles = np.concatenate(tri_list, axis=0)
+    else:
+        triangles = np.zeros((0, 3), dtype=np.int32)
+    
+    print(f"Mesh building: {len(vertices)} vertices, {len(triangles)} triangles")
+    
+    # Convert from OpenCV coords (X-right, Y-down, Z-forward)
+    # to Mitsuba/OpenGL coords (X-right, Y-up, Z-backward)
+    vertices_mitsuba = vertices * np.array([1.0, -1.0, -1.0], dtype=np.float32)
+    
+    # Create Open3D mesh
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices_mitsuba.astype(np.float64))
+    if len(triangles) > 0:
+        mesh.triangles = o3d.utility.Vector3iVector(triangles.astype(np.int32))
+    mesh.compute_vertex_normals()
+    
+    return mesh
+
+
+def build_mesh_from_depth_k(
+    depth: np.ndarray,
+    K: np.ndarray,
+    mask: np.ndarray = None,
+    mesh_mask: np.ndarray = None,
+) -> o3d.geometry.TriangleMesh:
+    """Build a triangle mesh via depth map + K back-projection (vectorized).
+
+    Uses STANDARD metric depth (larger = farther) directly -- no inversion or
+    normalization needed.
+
+    Pipeline:
+      1. Back-project depth+K to 3D points (OpenCV camera coords, Z-forward)
+      2. Triangulate the regular pixel grid
+      3. Convert OpenCV coords (X-right, Y-down, Z-forward)
+         to Mitsuba coords (X-right, Y-up, Z-backward)
+    """
+    h, w = depth.shape
+    depth = depth.astype(np.float64)
+
+    # Valid pixel mask
+    valid = np.isfinite(depth) & (depth > 0)
+    if mask is not None:
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        valid &= mask
+
+    # Apply user-provided mesh_mask (True = pixels to exclude)
+    if mesh_mask is not None:
+        if mesh_mask.shape[:2] != (h, w):
+            mesh_mask = cv2.resize(mesh_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        valid = valid & ~mesh_mask
+
+    # Back-project: point = depth * (K_inv @ [u, v, 1])
+    K_inv = np.linalg.inv(K.astype(np.float64))
+    u, v = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+    ray_x = K_inv[0, 0] * u + K_inv[0, 1] * v + K_inv[0, 2]
+    ray_y = K_inv[1, 0] * u + K_inv[1, 1] * v + K_inv[1, 2]
+    ray_z = K_inv[2, 0] * u + K_inv[2, 1] * v + K_inv[2, 2]
+    points = np.stack([ray_x * depth, ray_y * depth, ray_z * depth], axis=-1).astype(np.float32)
+
+    print(f"Mesh building: {valid.sum()} valid pixels out of {h * w} total")
+
+    # Build vertex index map
+    valid_indices = np.full((h, w), -1, dtype=np.int32)
+    valid_indices[valid] = np.arange(valid.sum(), dtype=np.int32)
+    vertices = points[valid]  # (N, 3) OpenCV coords
+
+    # Triangulate the grid (2 triangles per 2x2 cell, vectorized)
+    tl = valid_indices[:-1, :-1]
+    tr = valid_indices[:-1, 1:]
+    bl = valid_indices[1:, :-1]
+    br = valid_indices[1:, 1:]
+    tri1_valid = (tl >= 0) & (bl >= 0) & (tr >= 0)
+    tri1 = np.stack([tl[tri1_valid], bl[tri1_valid], tr[tri1_valid]], axis=-1)
+    tri2_valid = (tr >= 0) & (bl >= 0) & (br >= 0)
+    tri2 = np.stack([tr[tri2_valid], bl[tri2_valid], br[tri2_valid]], axis=-1)
+    tri_list = [t for t in [tri1, tri2] if len(t) > 0]
+    triangles = np.concatenate(tri_list, axis=0) if tri_list else np.zeros((0, 3), dtype=np.int32)
+
+    print(f"Mesh building: {len(vertices)} vertices, {len(triangles)} triangles")
+
+    # OpenCV (X-right, Y-down, Z-forward) -> Mitsuba (X-right, Y-up, Z-backward)
+    vertices_mitsuba = vertices * np.array([1.0, -1.0, -1.0], dtype=np.float32)
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices_mitsuba.astype(np.float64))
+    if len(triangles) > 0:
+        mesh.triangles = o3d.utility.Vector3iVector(triangles.astype(np.int32))
+    mesh.compute_vertex_normals()
+    return mesh
+
 
 def load_estimated_mesh(mesh_path, use_mesh_normal, cam_meta_path, max_path=4):
     """Load the reconstructed mesh with per-image intrinsics and fixed pose."""
@@ -49,7 +232,7 @@ def load_estimated_mesh(mesh_path, use_mesh_normal, cam_meta_path, max_path=4):
         "fov_axis": "y",
         "near_clip": float(camera_meta.get("near_clip", 0.01)),
         "far_clip": float(camera_meta.get("far_clip", 10000.0)),
-        # Keep Materialist's original camera pose. GeoCalib roll/pitch are ignored.
+        # Keep Materialist's original camera pose. MoGe2 roll/pitch are ignored.
         "to_world": mi.ScalarTransform4f.look_at(
             origin=[0, 0, 0],
             target=[0, 0, -1],
@@ -80,6 +263,7 @@ def load_estimated_mesh(mesh_path, use_mesh_normal, cam_meta_path, max_path=4):
         "emitter": {"type": "envmap", "filename": "envmaps/0.hdr"},
     })
     return scene
+
 
 def render_mesh_preview(mesh_path, cam_meta_path, output_dir, spp=64):
     """Render the reconstructed mesh with a plain white diffuse material."""
@@ -124,7 +308,7 @@ def render_envmap(scene,envmap,spp=64):
     random_seed = np.random.randint(0,1000)
     params['emitter.data']=envmap 
     params.update()
-    rendered_img=mi.render(scene, params, spp=spp, seed=random_seed)
+    rendered_img=mi.render(scene, params, spp=64, seed=random_seed)
 
     return rendered_img
 
@@ -710,8 +894,8 @@ def inverse_image(
     env_coordinate_type="spherical",
     model_name="pos_mlp",
     work_scale=0.5,
-    camera_source="geocalib",
     rebuild_mesh=False,
+    moge2_model_name="Ruicheng/moge-2-vitl-normal",
 ):
     print(f"Inverse image: {img_inverse_path}")
     spp = 64
@@ -721,59 +905,55 @@ def inverse_image(
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "best_results"), exist_ok=True)
 
-    # Read the complete image. No square crop is applied.
-    # raw_image = np.array(mi.Bitmap(img_inverse_path), dtype=np.float32)
-    # if raw_image.ndim == 2:
-    #     raw_image = np.repeat(raw_image[..., None], 3, axis=-1)
-    # if raw_image.shape[-1] > 3:
-    #     raw_image = raw_image[..., :3]
-    # original_h, original_w = raw_image.shape[:2]
-
-    # if not img_inverse_path.lower().endswith(".exr"):
-    #     warnings.warn(
-    #         "The input image is PNG/JPG; treating it as sRGB and converting to linear.",
-    #         UserWarning,
-    #     )
-    #     raw_image = srgb_to_linear(raw_image)
-    image_bgr = cv2.imread(
-        img_inverse_path,
-        cv2.IMREAD_UNCHANGED,
-    )
-    if image_bgr is None:
-        raise FileNotFoundError(img_inverse_path)
-
-    if image_bgr.ndim == 2:
-        image_bgr = cv2.cvtColor(
-            image_bgr,
-            cv2.COLOR_GRAY2BGR,
+    # Read the input image – support both EXR (linear HDR) and PNG/JPG (sRGB)
+    is_exr = img_inverse_path.lower().endswith('.exr')
+    if is_exr:
+        # EXR: mi.Bitmap returns linear RGB float32
+        raw_image = np.array(mi.Bitmap(img_inverse_path), dtype=np.float32)
+        if raw_image.ndim == 2:
+            raw_image = np.repeat(raw_image[:, :, None], 3, axis=2)
+        raw_image = raw_image[..., :3]
+        print(f"EXR loaded: shape={raw_image.shape}, range=[{raw_image.min():.4f}, {raw_image.max():.4f}]")
+        # Create uint8 sRGB version for MoGe2 (expects uint8 RGB)
+        raw_image_uint8 = np.clip(linear_to_srgb(np.clip(raw_image, 0, None)) * 255.0, 0, 255).astype(np.uint8)
+    else:
+        # PNG/JPG: cv2 returns uint8 BGR
+        image_bgr = cv2.imread(
+            img_inverse_path,
+            cv2.IMREAD_UNCHANGED,
         )
+        if image_bgr is None:
+            raise FileNotFoundError(img_inverse_path)
 
-    if image_bgr.shape[2] == 4:
-        image_bgr = image_bgr[:, :, :3]
+        if image_bgr.ndim == 2:
+            image_bgr = cv2.cvtColor(
+                image_bgr,
+                cv2.COLOR_GRAY2BGR,
+            )
 
-    raw_image = cv2.cvtColor(
-        image_bgr,
-        cv2.COLOR_BGR2RGB,
-    )
+        if image_bgr.shape[2] == 4:
+            image_bgr = image_bgr[:, :, :3]
+
+        raw_image = cv2.cvtColor(
+            image_bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+        raw_image_uint8 = raw_image  # already uint8
+        warnings.warn('The input image is in PNG/JPG format, assume it is sRGB.', UserWarning)
 
     original_h, original_w = raw_image.shape[:2]
     
     if not np.isfinite(work_scale) or work_scale <= 0:
         raise ValueError("work_scale must be a finite positive number")
 
-    # GeoCalib sees the original file and supplies focal length only.
-    if camera_source == "geocalib":
-        geo_camera = estimate_camera_geocalib(img_inverse_path, device="cuda")
-        if (geo_camera.height, geo_camera.width) != (original_h, original_w):
-            raise RuntimeError(
-                "GeoCalib and Materialist read different image sizes: "
-                f"GeoCalib={geo_camera.width}x{geo_camera.height}, "
-                f"Materialist={original_w}x{original_h}"
-            )
-    elif camera_source == "fixed35":
-        geo_camera = make_fixed35_camera(original_w, original_h)
-    else:
-        raise ValueError(f"Unknown camera_source: {camera_source}")
+    # Use MoGe2 for camera intrinsics and geometry estimation
+    print("Running MoGe2 inference for camera intrinsics and geometry...")
+    geo_camera, moge2_output = estimate_camera_moge2(
+        raw_image_uint8, 
+        device="cuda", 
+        model_name=moge2_model_name
+    )
+    print(f"MoGe2 estimated FOV: hfov={geo_camera.hfov_deg:.2f}°, vfov={geo_camera.vfov_deg:.2f}°")
 
     pred_mat = None
     preprocess_meta = None
@@ -792,8 +972,11 @@ def inverse_image(
         )
         matnet.load_state_dict(torch.load(model_path, weights_only=True))
         matnet = matnet.cuda().eval()
+        # For EXR: pass linear float to MatNet (same as inverse_img_w_mi_ori)
+        # For PNG/JPG: pass uint8 (MatNet internally handles normalization)
+        matnet_input = raw_image if is_exr else raw_image_uint8
         pred_mat, img_inverse, preprocess_meta = matnet.infer_image_scaled(
-            raw_image,
+            matnet_input,
             scale=work_scale,
         )
     else:
@@ -844,25 +1027,52 @@ def inverse_image(
     }
 
     print("Camera configuration:")
-    print(f"  source        = {camera_source}")
+    print(f"  source        = moge2 ({moge2_model_name})")
     print(f"  original size = {original_w} x {original_h}")
     print(f"  working size  = {work_w} x {work_h}")
     print(f"  hfov / vfov   = {camera_meta['x_fov'][0]:.3f} / {camera_meta['y_fov'][0]:.3f} deg")
     print(f"  fx / fy       = {K_work[0, 0]:.3f} / {K_work[1, 1]:.3f} px")
-    print("  GeoCalib roll/pitch ignored; Materialist pose is fixed.")
+    print("  MoGe2 roll/pitch ignored; Materialist pose is fixed.")
 
     if pred_mat is not None:
         albedo = pred_mat["albedo"]
-        normal = pred_mat["normal"]
+        # Use MoGe2 normal if available, otherwise use MaterialNet normal
+        if moge2_output['normal'] is not None:
+            # Resize MoGe2 normal to working resolution
+            moge2_normal = moge2_output['normal']
+            if moge2_normal.shape[:2] != (work_h, work_w):
+                moge2_normal = cv2.resize(moge2_normal, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
+            # Normalize the normal map
+            moge2_normal = moge2_normal / (np.linalg.norm(moge2_normal, axis=-1, keepdims=True) + 1e-8)
+            normal = moge2_normal
+            print("Using MoGe2 normal map")
+        else:
+            normal = pred_mat["normal"]
+            print("Using MaterialNet normal map (MoGe2 normal not available)")
+        
         roughness = pred_mat["roughness"]
         metallic = pred_mat["metallic"]
-        depth = pred_mat["depth"]
+        
+        # Use MoGe2 depth instead of MaterialNet depth. Invalid MoGe pixels are
+        # kept out of interpolation and converted to the mesh sentinel value 0.
+        depth, moge2_valid_mask = prepare_moge2_depth(
+            moge2_output,
+            target_hw=(work_h, work_w),
+        )
+        print(
+            "Using MoGe2 depth map "
+            f"({moge2_valid_mask.sum()}/{moge2_valid_mask.size} valid pixels)"
+        )
 
         if depth.shape[:2] != (work_h, work_w):
             raise RuntimeError(f"Depth size {depth.shape[:2]} != working size {(work_h, work_w)}")
 
         mat = {
-            "gt_image": srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda(),
+            "gt_image": (
+                torch.from_numpy(img_inverse).float().cuda()
+                if is_exr
+                else srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda()
+            ),
             "albedo": torch.from_numpy(albedo).cuda().clamp(0, 1),
             "normal": torch.from_numpy(normal).cuda(),
             "roughness": torch.from_numpy(roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
@@ -875,8 +1085,25 @@ def inverse_image(
         mi.util.write_bitmap(os.path.join(output_dir, "roughnessPred.png"), roughness)
         mi.util.write_bitmap(os.path.join(output_dir, "metallicPred.png"), metallic)
         mi.util.write_bitmap(os.path.join(output_dir, "depthPred.exr"), depth)
-        mi.util.write_bitmap(os.path.join(output_dir, "gt_image.exr"), img_inverse)
-        mi.util.write_bitmap(os.path.join(output_dir, "gt_image.png"), img_inverse)
+        if is_exr:
+            # img_inverse is already linear float32 from EXR
+            mi.util.write_bitmap(os.path.join(output_dir, "gt_image.exr"), img_inverse)
+            mi.util.write_bitmap(os.path.join(output_dir, "gt_image.png"), img_inverse)
+        else:
+            # img_inverse is uint8 sRGB; convert to linear float32 for EXR
+            img_inverse_linear = (img_inverse.astype(np.float32) / 255.0) ** 2.2
+            mi.util.write_bitmap(os.path.join(output_dir, "gt_image.exr"), img_inverse_linear)
+            mi.util.write_bitmap(os.path.join(output_dir, "gt_image.png"), img_inverse)
+        
+        # Save MoGe2 point cloud if available
+        if moge2_output['points'] is not None:
+            moge2_points = moge2_output['points']
+            if moge2_points.shape[:2] != (work_h, work_w):
+                # Resize point map
+                moge2_points_resized = cv2.resize(moge2_points, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                moge2_points_resized = moge2_points
+            mi.util.write_bitmap(os.path.join(output_dir, "moge2_points.exr"), moge2_points_resized)
 
         config = {
             "img_path": img_inverse_path,
@@ -888,7 +1115,8 @@ def inverse_image(
             "env_coordinate_type": env_coordinate_type,
             "model_name": model_name,
             "work_scale": work_scale,
-            "camera_source": camera_source,
+            "camera_source": "moge2",
+            "moge2_model": moge2_model_name,
             "camera_meta_path": camera_meta_path,
             "image_size": [work_h, work_w],
             "spp": spp,
@@ -919,8 +1147,17 @@ def inverse_image(
             mesh_mask = np.array(mesh_mask, dtype=np.bool_)
             if mesh_mask.ndim > 2:  # If it's an RGB image, use only the first channel
                 mesh_mask = mesh_mask[..., 0]
+            if mesh_mask.shape != (work_h, work_w):
+                mesh_mask = cv2.resize(
+                    mesh_mask.astype(np.uint8),
+                    (work_w, work_h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
         if rebuild_mesh or not os.path.exists(mesh_path):
-            depth_for_mesh = 2 * depth.max() - depth
+            # MoGe2 outputs standard metric depth (larger = farther), which is
+            # exactly what depth_file_to_mesh expects for back-projection.
+            # No inversion needed (unlike MaterialNet's inverse depth).
+            depth_for_mesh = depth.copy()
             if mesh_mask is not None:
                 depth_for_mesh[mesh_mask] = 0
                 print(f"Applied mask from {mesh_mask_path} to depth map")
@@ -932,7 +1169,7 @@ def inverse_image(
             print(f"Using existing mesh: {mesh_path}")
             print("Pass --rebuild_mesh after changing image scale or camera intrinsics.")
 
-        # Render mesh preview with initial MaterialNet predictions
+        # Render mesh preview with initial predictions
         render_mesh_preview(mesh_path, camera_meta_path, output_dir, spp=64)
 
         if opt_env_from > 1:
@@ -956,7 +1193,11 @@ def inverse_image(
             "roughness": torch.from_numpy(opted_roughness).unsqueeze(-1).cuda().clamp(0.07, 1),
             "metallic": torch.from_numpy(opted_metallic).unsqueeze(-1).cuda().clamp(0, 1),
             "normal": torch.from_numpy(opted_normal).cuda(),
-            "gt_image": srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda(),
+            "gt_image": (
+                torch.from_numpy(img_inverse).float().cuda()
+                if is_exr
+                else srgb_to_linear(torch.from_numpy(img_inverse).float().div(255.0)).cuda()
+            ),
         }
 
     if "n" in str(opt_order):
@@ -991,7 +1232,7 @@ def inverse_image(
 def parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Inverse-render a given image",
+        description="Inverse-render a given image using MoGe2 for geometry estimation",
     )
     parser.add_argument("--img_inverse_path", required=True, type=str)
     parser.add_argument("--save_name", required=True, type=str)
@@ -1017,15 +1258,15 @@ def parse_args():
         help="Aspect-ratio-preserving scale applied to the complete input image",
     )
     parser.add_argument(
-        "--camera_source",
-        default="geocalib",
-        choices=["geocalib", "fixed35"],
-        help="Use GeoCalib focal initialization or the original 35-degree fallback",
-    )
-    parser.add_argument(
         "--rebuild_mesh",
         action="store_true",
         help="Regenerate the mesh with the current working-resolution K",
+    )
+    parser.add_argument(
+        "--moge2_model",
+        default="/home/majortom/project/datasets/ckpt/moge2_vitl_normal.pt",
+        type=str,
+        help="MoGe2 model name from HuggingFace Hub",
     )
     return parser.parse_args()
 
@@ -1042,8 +1283,8 @@ def inverse_real(args):
         env_coordinate_type=args.env_coordinate_type,
         model_name=args.model_name,
         work_scale=args.work_scale,
-        camera_source=args.camera_source,
         rebuild_mesh=args.rebuild_mesh,
+        moge2_model_name=args.moge2_model,
     )
 
 

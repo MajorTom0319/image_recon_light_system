@@ -231,10 +231,11 @@ class MaterialNet(nn.Module):
         Args:
             raw_image:
                 H x W x 3 的 numpy 图像。
-                uint8 输入范围应为 [0, 255]；
-                float 输入通常应为 [0, 1]。
+                整数输入会按 dtype 最大值归一化；float 输入保持原值，
+                因而可以表示线性 HDR，调用方需明确其颜色空间。
             scale:
-                网络工作分辨率相对于输入图像的比例。
+                网络工作分辨率相对于输入图像的比例；该值会直接改变
+                MatNet 的实际推理分辨率。
                 scale=0.5 表示长宽分别缩小两倍。
             patch_size:
                 DINOv2 ViT-B/14 的 patch size，固定为 14。
@@ -246,7 +247,8 @@ class MaterialNet(nn.Module):
                 缩小后的输入图像，不包含 padding，
                 可直接作为后续 inverse rendering 的目标图像。
             meta:
-                原始尺寸、工作尺寸和网络实际输入尺寸。
+                原始尺寸、工作尺寸、网络实际输入尺寸及内参缩放矩阵。
+                所有尺寸字段均使用 [width, height] 顺序。
         """
         if not isinstance(raw_image, np.ndarray):
             raise TypeError(
@@ -258,13 +260,18 @@ class MaterialNet(nn.Module):
                 f"Expected HxWx3 image, got shape {raw_image.shape}"
             )
 
-        if scale <= 0:
-            raise ValueError(f"scale must be positive, got {scale}")
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"scale must be a finite positive number, got {scale}")
+
+        if not isinstance(patch_size, int) or patch_size <= 0:
+            raise ValueError(f"patch_size must be a positive integer, got {patch_size}")
 
         # 只保留 RGB，避免某些 PNG 带 alpha 通道。
         raw_image = raw_image[..., :3]
 
         orig_h, orig_w = raw_image.shape[:2]
+        if orig_h <= 0 or orig_w <= 0:
+            raise ValueError(f"Input image dimensions must be positive, got {raw_image.shape}")
 
         # 严格按照同一个 scale 缩小，保持宽高比。
         work_h = max(1, int(round(orig_h * scale)))
@@ -276,11 +283,14 @@ class MaterialNet(nn.Module):
             else cv2.INTER_CUBIC
         )
 
-        work_image = cv2.resize(
-            raw_image,
-            (work_w, work_h),
-            interpolation=interpolation,
-        )
+        if (work_h, work_w) == (orig_h, orig_w):
+            work_image = raw_image.copy()
+        else:
+            work_image = cv2.resize(
+                raw_image,
+                (work_w, work_h),
+                interpolation=interpolation,
+            )
 
         # 向上 padding 到 14 的整数倍。
         # 不直接拉伸到 14n，避免改变图像宽高比。
@@ -300,18 +310,22 @@ class MaterialNet(nn.Module):
             borderType=cv2.BORDER_REFLECT_101,
         )
 
-        # 与原始 image2tensor() 保持相同的数据范围处理。
-        if padded_image.dtype == np.uint8:
-            image = padded_image.astype(np.float32) / 255.0
+        # Integer images are code values; float images may be genuine linear
+        # HDR and must never be silently divided by 255 based on their range.
+        if np.issubdtype(padded_image.dtype, np.integer):
+            dtype_max = float(np.iinfo(padded_image.dtype).max)
+            image = padded_image.astype(np.float32) / dtype_max
         else:
             image = padded_image.astype(np.float32)
 
+        if not np.isfinite(image).all():
+            raise ValueError("MatNet input contains NaN or Inf")
         if image.max() > 10:
             warnings.warn(
-                "Input intensity is unusually high. Dividing by 255.",
+                "Float MatNet input contains HDR values above 10; values are "
+                "preserved because float inputs are interpreted as linear radiance.",
                 UserWarning,
             )
-            image = image / 255.0
 
         # PrepareForNet 会执行 HWC -> CHW 等转换。
         transform = Compose([
@@ -350,15 +364,36 @@ class MaterialNet(nn.Module):
             "normal": normal[0].permute(1, 2, 0).cpu().numpy(),
         }
 
+        scale_x = work_w / float(orig_w)
+        scale_y = work_h / float(orig_h)
+        pixel_transform = np.array(
+            [
+                [scale_x, 0.0, 0.0],
+                [0.0, scale_y, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
         meta = {
-            "original_size": (orig_h, orig_w),
-            "work_size": (work_h, work_w),
-            "network_size": (net_h, net_w),
+            # All image-size fields use [width, height]. This matches OpenCV's
+            # resize convention and the camera metadata consumers.
+            "original_size": [int(orig_w), int(orig_h)],
+            "work_size": [int(work_w), int(work_h)],
+            "network_size": [int(net_w), int(net_h)],
+            "crop_box": [0, 0, int(orig_w), int(orig_h)],
+            "scale_x": float(scale_x),
+            "scale_y": float(scale_y),
+            "pixel_transform": pixel_transform.tolist(),
             "padding": {
+                "top": 0,
                 "bottom": pad_bottom,
+                "left": 0,
                 "right": pad_right,
             },
-            "scale": scale,
+            "scale": float(scale),
+            "requested_scale": float(scale),
+            "center_crop": False,
+            "patch_size": patch_size,
         }
 
         return pred, work_image, meta
@@ -414,4 +449,3 @@ class MaterialNet(nn.Module):
         DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
         image = image.to(DEVICE)
         return image, (h, w)
-

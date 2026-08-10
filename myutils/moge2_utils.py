@@ -159,6 +159,95 @@ def prepare_moge2_depth(
     return clean_depth, valid
 
 
+def _prepare_masked_vector_field(
+    field: np.ndarray,
+    valid: np.ndarray,
+    target_hw: tuple[int, int],
+    *,
+    normalize: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize a masked HxWx3 field without bleeding invalid samples."""
+    target_h, target_w = (int(target_hw[0]), int(target_hw[1]))
+    field = np.asarray(field, dtype=np.float32)
+    valid = np.asarray(valid, dtype=bool)
+    if field.ndim != 3 or field.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 vector field, got {field.shape}")
+    if valid.shape != field.shape[:2]:
+        raise ValueError(
+            f"Validity mask shape {valid.shape} does not match field {field.shape[:2]}"
+        )
+
+    valid &= np.isfinite(field).all(axis=-1)
+    if field.shape[:2] != (target_h, target_w):
+        valid_weight = cv2.resize(
+            valid.astype(np.float32),
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        weighted = cv2.resize(
+            np.where(valid[..., None], field, 0.0),
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        field = np.divide(
+            weighted,
+            valid_weight[..., None],
+            out=np.zeros_like(weighted, dtype=np.float32),
+            where=valid_weight[..., None] > 1e-6,
+        )
+        nearest_valid = cv2.resize(
+            valid.astype(np.uint8),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        valid = nearest_valid & (valid_weight > 1e-6)
+
+    valid &= np.isfinite(field).all(axis=-1)
+    if normalize:
+        lengths = np.linalg.norm(field, axis=-1)
+        valid &= lengths > 1e-8
+        field = np.divide(
+            field,
+            lengths[..., None],
+            out=np.zeros_like(field, dtype=np.float32),
+            where=lengths[..., None] > 1e-8,
+        )
+    field = np.where(valid[..., None], field, 0.0).astype(np.float32)
+    return np.ascontiguousarray(field), valid
+
+
+def prepare_moge2_points(
+    moge2_output: dict,
+    target_hw: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite MoGe camera-space points at ``target_hw``."""
+    points = np.asarray(moge2_output["points"], dtype=np.float32)
+    mask = np.asarray(moge2_output.get("mask", np.ones(points.shape[:2])), dtype=bool)
+    mask &= np.linalg.norm(points, axis=-1) > 1e-8
+    return _prepare_masked_vector_field(points, mask, target_hw, normalize=False)
+
+
+def prepare_moge2_normal(
+    moge2_output: dict,
+    target_hw: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite unit MoGe camera-space normals at ``target_hw``."""
+    if moge2_output.get("normal") is None:
+        raise ValueError("MoGe output does not contain normals")
+    normal = np.asarray(moge2_output["normal"], dtype=np.float32)
+    mask = np.asarray(moge2_output.get("mask", np.ones(normal.shape[:2])), dtype=bool)
+    return _prepare_masked_vector_field(normal, mask, target_hw, normalize=True)
+
+
+def camera_to_materialist_vectors(field: np.ndarray) -> np.ndarray:
+    """Apply the mesh's Rx(180°): (x, y, z) -> (x, -y, -z)."""
+    transformed = np.asarray(field, dtype=np.float32).copy()
+    if transformed.ndim < 1 or transformed.shape[-1] != 3:
+        raise ValueError(f"Expected vectors with final dimension 3, got {field.shape}")
+    transformed[..., 1:] *= -1.0
+    return np.ascontiguousarray(transformed)
+
+
 def prepare_dense_moge2_depth(
     moge2_output: dict,
     target_hw: tuple[int, int],
