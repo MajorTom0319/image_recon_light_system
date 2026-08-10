@@ -97,7 +97,8 @@ def _find_material_maps(root: Path, explicit: Path | None) -> dict[str, Path]:
         "albedo": ("albedo.exr", "albedoPred.exr"),
         "roughness": ("roughness.exr", "roughnessPred.exr"),
         "metallic": ("metallic.exr", "metallicPred.exr"),
-        "normal": ("normal.exr", "normalPred.exr"),
+        # "normal": ("normal.exr", "normalPred.exr"),
+        "normal": ("normal.exr", "moge2_normal.exr"),
     }
     for directory in directories:
         result = {}
