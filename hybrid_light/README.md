@@ -100,17 +100,39 @@ ARM maps:
   --farfield-iters 300 \
   --material-iters 500 \
   --material-order rm a \
+  --model_name none \
   --spp 64 --spp-grad 64 --preview-spp 512
 ```
 
-By default, the target is the original image path recorded in the ILE JSON, not
-the legacy `gt_image.exr`. This avoids treating sRGB PNG values stored in an old
-EXR as linear data; `target.png` is only a preview and never enters the loss.
+`--model_name none` retains the original direct per-pixel optimization. To use
+Materialist's positional MLP for both Stage C and Stage D, change it to:
+
+```bash
+--model_name pos_mlp
+```
+
+The PosMLP branch parameterizes the HDRI with spherical coordinates and the
+ARM maps with image-space UV coordinates. It keeps the same loss terms,
+constraints, `rm -> a` phase order, best-checkpoint selection, frozen-channel
+checks, HDRI reload, and final validation gate as the direct branch. Its HDRI
+head is initialized to `--farfield-init`, rather than the PosMLP default
+`softplus(0)`. Both modes export the same EXR/HDR/PNG files; the selected mode
+is recorded as `model_name` in `optimization_manifest.json`. The default is
+`none`, so existing commands retain their previous behavior. PosMLP requires
+CUDA because gradients pass between PyTorch and Mitsuba/Dr.Jit.
+
+An explicit `--target` always has highest priority. Otherwise a completed
+inference manifest with schema v2 or newer selects the corrected linear
+`gt_image.exr`, which shares the material/mesh working resolution. Legacy runs
+without a verified manifest fall back to the original image recorded in the
+ILE JSON, avoiding old EXRs that stored sRGB values as linear. `target.png` is
+only a preview and never enters the loss.
 
 The default material order is `rm -> a`: roughness and metallic are optimized
 together first, their best checkpoint is frozen, and albedo is optimized last.
-Each phase gets a fresh Adam/StepLR and early-stopping state. The loss follows
-the direct real-image branch in `inverse_img_w_mi_ori.py`: display-space
+Each phase gets a fresh optimizer, StepLR-equivalent schedule, and
+early-stopping state: direct pixels use Adam, while PosMLP uses AdamW. The loss
+follows the real-image branch in `inverse_img_w_mi_ori.py`: display-space
 adaptive MSE + L1 and an L1 prior to the input material maps. Default learning
 rate (`3e-4`), prior weight (`0.1`), bounds, and phase-specific improvement
 thresholds also follow that branch. Detached mean-exposure matching remains
@@ -132,5 +154,6 @@ The material candidate still uses a same-seed high-SPP validation gate. Inspect
 frozen-channel error; a nonzero error above tolerance aborts the run. Also
 inspect `farfield_metrics.json`, `final_metrics.json`, and the corresponding
 `*_target_render_error.png` comparisons. The latest default output directory is
-`hybrid_ile_farfield_material_opt_v5/`; older directories contain previous
-material-order or HDRI-selection semantics and should not be mixed with v5.
+`hybrid_ile_farfield_material_opt_v6/`; older directories contain previous
+material-order, target, or HDRI-selection semantics and should not be mixed
+with v6.

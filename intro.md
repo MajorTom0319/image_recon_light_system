@@ -64,7 +64,7 @@ mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定，mesh builder �
 | `hybrid_light/README.md` | Hybrid prototype 的运行方式和当前约束 |
 | `scripts/render_ile_lights.py` | 初版融合渲染入口，支持验证、消融和三种光照模式 |
 | `scripts/optimize_ile_farfield.py` | Stage B 逐灯 scale 优化，以及 Stage C 32×16 far-field HDRI 优化入口 |
-| `scripts/optimize_ile_farfield_materials.py` | 关闭 Stage B、固定 ILE 灯强度，依次优化 Stage C far-field HDRI、Stage D roughness/metallic，最后优化 albedo |
+| `scripts/optimize_ile_farfield_materials.py` | 关闭 Stage B、固定 ILE 灯强度，支持逐像素或 PosMLP 参数化，依次优化 Stage C far-field HDRI、Stage D roughness/metallic，最后优化 albedo |
 | `tests/test_hybrid_light.py` | 坐标方向、投影 round-trip、尺度同步和 JSON 读取测试 |
 | `materialist_indoorlightediting_hybrid_method.md` | 完整方法设计、阶段规划和实验建议 |
 
@@ -85,7 +85,7 @@ mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定，mesh builder �
 
 逐灯与 far-field 优化使用独立入口 `scripts/optimize_ile_farfield.py`。Stage B 保持 ILE RGB 色度不变，只优化每盏灯的非负 scalar scale；Stage C 固定局部灯，优化内部形状为 `(16, 32, 3)` 的 HDR envmap，并加入能量与球面周期 TV 正则。
 
-固定灯光实验使用 `scripts/optimize_ile_farfield_materials.py`：完全跳过 Stage B，先固定 ILE radiance 优化 HDRI，再冻结全部光照，默认先联合优化 roughness/metallic 并冻结最优结果，最后单独优化 albedo。每个材质阶段使用独立 Adam/StepLR 与 early stopping，并检查未参与该阶段的材质通道严格不变。默认直接使用 ILE JSON 记录的原始输入图作为 target，材质 loss 参考 `inverse_img_w_mi_ori.py` 的显示空间 MSE/L1 和输入材质先验；曝光对齐改为可选。Stage C 只输出一份权威的 `farfield_optimized_32x16.exr/.hdr`，Stage D 会从该 EXR 重新建场景，并校验材质优化前后 env tensor 完全不变。
+固定灯光实验使用 `scripts/optimize_ile_farfield_materials.py`：完全跳过 Stage B，先固定 ILE radiance 优化 HDRI，再冻结全部光照，默认先联合优化 roughness/metallic 并冻结最优结果，最后单独优化 albedo。`--model_name none` 保留逐像素优化，`--model_name pos_mlp` 使用 Materialist PosMLP 同时参数化球面 HDRI 和 UV 空间 ARM；两者共享 loss、顺序、checkpoint、冻结检查与输出格式。每个材质阶段使用独立优化器与 early stopping，并检查未参与该阶段的材质通道严格不变。新版完整 inference manifest 优先使用同工作分辨率的线性 `gt_image.exr`，旧结果回退 ILE JSON 原始图；材质 loss 参考 `inverse_img_w_mi_ori.py` 的显示空间 MSE/L1 和输入材质先验，曝光对齐为可选。Stage C 只输出一份权威的 `farfield_optimized_32x16.exr/.hdr`，Stage D 会从该 EXR 重新建场景，并校验材质优化前后 env tensor 完全不变。
 
 ## 其他主要入口
 

@@ -28,6 +28,7 @@ from hybrid_light.io import load_ile_lights
 from hybrid_light.mitsuba_builder import build_hybrid_scene_dict
 from hybrid_light.visualization import render_projection_debug
 from scripts.optimize_ile_farfield import (
+    cosine_learning_rate,
     linear_to_srgb_dr,
     linear_to_srgb_np,
     load_target_linear,
@@ -72,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--geometry-scale", type=float, default=None)
     parser.add_argument("--radiance-scale", type=float, default=1.0)
     parser.add_argument("--visible-offset", type=float, default=0.005)
+    parser.add_argument(
+        "--model_name",
+        "--model-name",
+        choices=("none", "pos_mlp"),
+        default="none",
+        help="Optimization parameterization: direct pixels or Materialist PosMLP",
+    )
 
     # Width x height = 32 x 16; the array layout is H x W x C.
     parser.add_argument("--farfield-width", type=int, default=32)
@@ -523,6 +531,399 @@ def optimize_materials(
     return final_materials, history, phase_summaries
 
 
+def _torch_linear_to_srgb(torch, value):
+    value = torch.clamp_min(value, 0.0)
+    return torch.where(
+        value <= 0.0031308,
+        12.92 * value,
+        1.055 * torch.pow(torch.clamp_min(value, 0.0031308), 1.0 / 2.4) - 0.055,
+    )
+
+
+def optimize_farfield_pos_mlp(
+    mi,
+    dr,
+    *,
+    scene,
+    params,
+    target_srgb,
+    args,
+) -> tuple[np.ndarray, list[dict[str, Any]], float]:
+    """PosMLP parameterization of the existing Stage-C objective."""
+    import torch
+    import torch.nn.functional as F
+    from mymodels.mlps import PosMLP
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("--model_name pos_mlp requires CUDA")
+    env_key = "far_field_env.data"
+    storage_shape = tuple(int(value) for value in params[env_key].shape)
+    expected_shapes = {
+        (args.farfield_height, args.farfield_width, 3),
+        (args.farfield_height, args.farfield_width + 1, 3),
+    }
+    if storage_shape not in expected_shapes:
+        raise ValueError(f"Unexpected far-field tensor shape: {storage_shape}")
+
+    device = torch.device("cuda")
+    torch.manual_seed(args.seed)
+    start_envmap = torch.full(
+        (args.farfield_height * args.farfield_width, 3),
+        args.farfield_init,
+        dtype=torch.float32,
+        device=device,
+    )
+    envmap_net = PosMLP(
+        in_dims=6,
+        out_dims=3,
+        dims=[256] * 4,
+        skip_connection=[1, 3],
+        weight_norm=False,
+        multires_view=2,
+        output_type="envmap",
+        color_ch=3,
+        img_h=args.farfield_height,
+        img_w=args.farfield_width,
+        coordinate_type="spherical",
+    ).to(device)
+    # PosMLP's zero-initialized head otherwise starts at softplus(0)=0.693.
+    # Match the direct branch's --farfield-init without changing the network.
+    output_layer = getattr(envmap_net, f"lin{envmap_net.num_layers - 2}")
+    initial_bias = float(np.log(np.expm1(max(args.farfield_init, 1e-6))))
+    with torch.no_grad():
+        output_layer.bias.fill_(initial_bias)
+    optimizer = torch.optim.Adam(envmap_net.parameters(), lr=args.farfield_lr)
+    target = torch.as_tensor(
+        np.asarray(target_srgb, dtype=np.float32), device=device
+    )
+
+    @dr.wrap(source="torch", target="drjit")
+    def render_envmap(envmap, seed):
+        params[env_key] = envmap
+        params.update()
+        return mi.render(
+            scene,
+            params,
+            spp=args.spp,
+            spp_grad=args.spp_grad,
+            seed=seed,
+            seed_grad=seed + 1,
+        )
+
+    history: list[dict[str, Any]] = []
+    best_loss = float("inf")
+    best_env: np.ndarray | None = None
+    for iteration in range(args.farfield_iters):
+        learning_rate = cosine_learning_rate(
+            iteration, args.farfield_iters, args.farfield_lr
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+        logical_env = envmap_net(start_envmap).reshape(
+            args.farfield_height, args.farfield_width, 3
+        )
+        logical_env = torch.clamp(logical_env, 0.0, args.farfield_max)
+        storage_env = (
+            torch.cat([logical_env, logical_env[:, :1]], dim=1)
+            if storage_shape[1] == args.farfield_width + 1
+            else logical_env
+        )
+        iteration_seed = iteration if args.resample_each_iteration else 0
+        seed = args.seed + (args.stage_b_iters + iteration_seed) * 2
+        rendered_srgb = _torch_linear_to_srgb(
+            torch, render_envmap(storage_env, seed)
+        )
+        difference = rendered_srgb - target
+        loss_charbonnier = torch.mean(
+            torch.sqrt(difference.square() + args.charbonnier_epsilon**2)
+        ) - args.charbonnier_epsilon
+        loss_mse = F.mse_loss(rendered_srgb, target)
+        right = torch.roll(logical_env, shifts=-1, dims=1)
+        down = torch.cat([logical_env[1:], logical_env[-1:]], dim=0)
+        loss_tv = torch.mean(torch.abs(logical_env - right)) + torch.mean(
+            torch.abs(logical_env - down)
+        )
+        loss_energy = torch.mean(logical_env.square())
+        loss = (
+            args.charbonnier_weight * loss_charbonnier
+            + args.mse_weight * loss_mse
+            + args.farfield_tv_weight * loss_tv
+            + args.farfield_energy_weight * loss_energy
+        )
+        loss_value = float(loss.detach())
+        mse_value = float(loss_mse.detach())
+        history.append(
+            {
+                "iteration": iteration,
+                "loss": loss_value,
+                "charbonnier": float(loss_charbonnier.detach()),
+                "mse": mse_value,
+                "tv": float(loss_tv.detach()),
+                "energy": float(loss_energy.detach()),
+                "learning_rate": learning_rate,
+            }
+        )
+        checkpoint_value = (
+            mse_value
+            if args.farfield_checkpoint_metric == "mse"
+            else loss_value
+        )
+        if checkpoint_value < best_loss:
+            best_loss = checkpoint_value
+            best_env = storage_env.detach().cpu().numpy().copy()
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if iteration % args.log_interval == 0 or iteration == args.farfield_iters - 1:
+            print(
+                f"[Far-field PosMLP {iteration:04d}/{args.farfield_iters}] "
+                f"loss={loss_value:.6f} charb={float(loss_charbonnier.detach()):.6f} "
+                f"mse={mse_value:.6f} tv={float(loss_tv.detach()):.6f} "
+                f"energy={float(loss_energy.detach()):.6f}"
+            )
+
+    if best_env is None:
+        raise RuntimeError("PosMLP far-field optimization produced no checkpoint")
+    params[env_key] = mi.TensorXf(best_env)
+    params.update()
+    return best_env, history, best_loss
+
+
+def optimize_materials_pos_mlp(
+    mi,
+    dr,
+    *,
+    scene,
+    params,
+    initial_materials: dict[str, np.ndarray],
+    target_linear,
+    target_srgb,
+    args,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
+    """PosMLP parameterization of the existing sequential material phases."""
+    import torch
+    import torch.nn.functional as F
+    from mymodels.mlps import PosMLP
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("--model_name pos_mlp requires CUDA")
+    device = torch.device("cuda")
+    target = torch.as_tensor(
+        np.asarray(target_srgb, dtype=np.float32), device=device
+    )
+    target_mean = float(np.asarray(target_linear, dtype=np.float32).mean())
+
+    @dr.wrap(source="torch", target="drjit")
+    def render_materials(albedo, roughness, metallic, seed):
+        params[MATERIAL_KEYS["a"]] = albedo
+        params[MATERIAL_KEYS["r"]] = roughness
+        params[MATERIAL_KEYS["m"]] = metallic
+        params.update()
+        return mi.render(
+            scene,
+            params,
+            spp=args.spp,
+            spp_grad=args.spp_grad,
+            seed=seed,
+            seed_grad=seed + 1,
+        )
+
+    order = list(args.material_order)
+    history: list[dict[str, Any]] = []
+    phase_summaries: list[dict[str, Any]] = []
+    final_materials: dict[str, np.ndarray] = {}
+    for phase_index, phase in enumerate(order):
+        channels = tuple(phase)
+        current = {
+            channel: np.asarray(params[MATERIAL_KEYS[channel]], dtype=np.float32).copy()
+            for channel in "arm"
+        }
+        frozen_channels = tuple(channel for channel in "arm" if channel not in channels)
+        frozen_before = {channel: current[channel].copy() for channel in frozen_channels}
+        base_arm = np.concatenate(
+            [
+                current["a"],
+                (current["r"] - 0.07) / 0.93,
+                current["m"],
+            ],
+            axis=-1,
+        )
+        base_arm_torch = torch.as_tensor(
+            base_arm.reshape(-1, 5), dtype=torch.float32, device=device
+        )
+        torch.manual_seed(args.seed + phase_index + 1)
+        brdf_net = PosMLP(
+            in_dims=7,
+            out_dims=5,
+            dims=[256] * 4,
+            skip_connection=[1, 3],
+            weight_norm=False,
+            multires_view=2,
+            output_type="arm",
+            color_ch=5,
+            img_h=current["a"].shape[0],
+            img_w=current["a"].shape[1],
+            coordinate_type="uv",
+        ).to(device)
+        optimizer = torch.optim.AdamW(brdf_net.parameters(), lr=args.material_lr)
+        initial = {
+            channel: torch.as_tensor(
+                initial_materials[channel], dtype=torch.float32, device=device
+            )
+            for channel in channels
+        }
+        current_torch = {
+            channel: torch.as_tensor(value, dtype=torch.float32, device=device)
+            for channel, value in current.items()
+        }
+        best_mse = float("inf")
+        best_phase_materials: dict[str, np.ndarray] | None = None
+        early_stop_reference: float | None = None
+        stale_iterations = 0
+        phase_min_delta = (
+            args.material_min_delta
+            if args.material_min_delta is not None
+            else (0.005 if "a" in channels else 0.001)
+        )
+        phase_start = len(history)
+        print(
+            f"[Material PosMLP phase {phase_index + 1}/{len(order)}] "
+            f"optimize={phase} frozen={''.join(frozen_channels) or 'none'}"
+        )
+
+        for iteration in range(args.material_iters):
+            learning_rate = material_learning_rate(iteration, args)
+            for group in optimizer.param_groups:
+                group["lr"] = learning_rate
+            arm = brdf_net(base_arm_torch)
+            predicted = {
+                "a": arm[:, :3].reshape(current["a"].shape),
+                "r": (arm[:, 3:4] * 0.93 + 0.07).reshape(current["r"].shape),
+                "m": arm[:, 4:5].reshape(current["m"].shape),
+            }
+            materials = {
+                channel: predicted[channel] if channel in channels else current_torch[channel]
+                for channel in "arm"
+            }
+            iteration_seed = iteration if args.resample_each_iteration else 0
+            seed_offset = phase_index * args.material_iters + iteration_seed
+            seed = args.seed + (args.farfield_iters + seed_offset) * 2
+            rendered_linear = render_materials(
+                materials["a"], materials["r"], materials["m"], seed
+            )
+            exposure_ratio = 1.0
+            if args.material_exposure_match:
+                exposure_ratio = target_mean / max(
+                    float(rendered_linear.detach().mean()), 1e-6
+                )
+            rendered_srgb = _torch_linear_to_srgb(
+                torch, rendered_linear * exposure_ratio
+            )
+            difference = rendered_srgb - target
+            loss_mse = torch.mean(difference.square())
+            loss_l1 = torch.mean(torch.abs(difference))
+            loss_balance = loss_l1.detach() / torch.clamp_min(
+                loss_mse.detach(), 1e-8
+            )
+            loss_render = 3.0 * loss_balance * loss_mse + loss_l1
+            prior_values = {
+                channel: torch.mean(torch.abs(materials[channel] - initial[channel]))
+                for channel in channels
+            }
+            loss_prior = sum(prior_values.values(), torch.zeros((), device=device))
+            loss = loss_render + args.material_prior_weight * loss_prior
+            loss_value = float(loss.detach())
+            mse_value = float(loss_mse.detach())
+            history.append(
+                {
+                    "global_iteration": len(history),
+                    "phase_index": phase_index,
+                    "phase": phase,
+                    "phase_iteration": iteration,
+                    "loss": loss_value,
+                    "render_loss": float(loss_render.detach()),
+                    "mse": mse_value,
+                    "l1": float(loss_l1.detach()),
+                    "prior": float(loss_prior.detach()),
+                    "exposure_ratio": float(exposure_ratio),
+                    "learning_rate": float(learning_rate),
+                    "channel_priors": {
+                        channel: float(value.detach())
+                        for channel, value in prior_values.items()
+                    },
+                }
+            )
+            if mse_value < best_mse:
+                best_mse = mse_value
+                best_phase_materials = {
+                    MATERIAL_KEYS[channel]: materials[channel].detach().cpu().numpy().copy()
+                    for channel in channels
+                }
+            if (
+                early_stop_reference is None
+                or mse_value < early_stop_reference * (1.0 - phase_min_delta)
+            ):
+                early_stop_reference = mse_value
+                stale_iterations = 0
+            else:
+                stale_iterations += 1
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            if iteration % args.log_interval == 0 or iteration == args.material_iters - 1:
+                print(
+                    f"[Material PosMLP {phase} {iteration:04d}/{args.material_iters}] "
+                    f"loss={loss_value:.6f} render={float(loss_render.detach()):.6f} "
+                    f"mse={mse_value:.6f} l1={float(loss_l1.detach()):.6f} "
+                    f"prior={float(loss_prior.detach()):.6f} "
+                    f"exposure={float(exposure_ratio):.4f}"
+                )
+            if stale_iterations >= args.material_patience:
+                print(f"[Material PosMLP {phase}] early stopping at {iteration}")
+                break
+
+        if best_phase_materials is None:
+            raise RuntimeError(f"PosMLP material phase {phase!r} produced no checkpoint")
+        for key, value in best_phase_materials.items():
+            params[key] = mi.TensorXf(value)
+            final_materials[key] = value
+        params.update()
+        frozen_max_abs_diff = max(
+            (
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(params[MATERIAL_KEYS[channel]], dtype=np.float32)
+                            - frozen_before[channel]
+                        )
+                    )
+                )
+                for channel in frozen_channels
+            ),
+            default=0.0,
+        )
+        if frozen_max_abs_diff > 1e-7:
+            raise RuntimeError(
+                f"Frozen material channels changed during phase {phase!r}: "
+                f"max_abs_diff={frozen_max_abs_diff:.6g}"
+            )
+        phase_summaries.append(
+            {
+                "phase_index": phase_index,
+                "phase": phase,
+                "channels": list(channels),
+                "iterations": len(history) - phase_start,
+                "best_display_mse": best_mse,
+                "min_delta": phase_min_delta,
+                "frozen_channels": list(frozen_channels),
+                "frozen_max_abs_diff": frozen_max_abs_diff,
+            }
+        )
+    return final_materials, history, phase_summaries
+
+
 def save_material_outputs(
     mi,
     output_dir: Path,
@@ -565,7 +966,7 @@ def main() -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else materialist_dir / "hybrid_ile_farfield_material_opt_v5"
+        else materialist_dir / "hybrid_ile_farfield_material_opt_none_posmlp"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -641,7 +1042,12 @@ def main() -> None:
         seed=farfield_validation_seed,
         denoise=not args.no_denoise,
     )
-    best_farfield, farfield_history, farfield_best_loss = optimize_farfield(
+    farfield_optimizer = (
+        optimize_farfield_pos_mlp
+        if args.model_name == "pos_mlp"
+        else optimize_farfield
+    )
+    best_farfield, farfield_history, farfield_best_loss = farfield_optimizer(
         mi,
         dr,
         scene=scene,
@@ -732,7 +1138,12 @@ def main() -> None:
         seed=material_validation_seed,
         denoise=not args.no_denoise,
     )
-    best_materials, material_history, material_phase_summaries = optimize_materials(
+    material_optimizer = (
+        optimize_materials_pos_mlp
+        if args.model_name == "pos_mlp"
+        else optimize_materials
+    )
+    best_materials, material_history, material_phase_summaries = material_optimizer(
         mi,
         dr,
         scene=scene,
@@ -806,6 +1217,7 @@ def main() -> None:
         "schema_version": 4,
         "status": "complete",
         "stage_b_enabled": False,
+        "model_name": args.model_name,
         "materialist_dir": str(materialist_dir),
         "mesh": str(mesh_path),
         "camera_meta": str(camera_path),

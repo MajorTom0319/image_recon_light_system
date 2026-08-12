@@ -1,8 +1,8 @@
 # Materialist 当前实施进展
 
-更新时间：2026-08-07
+更新时间：2026-08-11
 
-当前阶段：相机、MoGe2 metric geometry、MatNet 材质和 IndoorLightEditing 显式灯光已经接入同一 Mitsuba 场景。Example1 已完成 local-only、visible-only 和 invisible-only 渲染；Stage B 逐灯 scale、Stage C 32×16 far-field HDRI，以及“关闭 Stage B，HDRI 后优化 ARM 材质”的分阶段主流程均已实现并通过最小 GPU smoke test。下一步进行正式迭代、超参数调节和结果评估。
+当前阶段：相机、MoGe2 metric geometry、MatNet 材质和 IndoorLightEditing 显式灯光已经接入同一 Mitsuba 场景。Example1 已完成 local-only、visible-only 和 invisible-only 渲染；Stage B 逐灯 scale、Stage C 32×16 far-field HDRI，以及“关闭 Stage B，HDRI 后优化 ARM 材质”的分阶段主流程均已实现。固定灯光入口现同时支持逐像素和 PosMLP 两种参数化，并已通过最小 GPU smoke test。下一步进行正式迭代、超参数调节和两种参数化的结果评估。
 
 ## 当前数据链路
 
@@ -99,13 +99,16 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - 新增 `scripts/optimize_ile_farfield_materials.py`，与已有优化入口相互独立。
 - ILE lamp RGB 只乘固定的全局 `--radiance-scale`，整个实验不创建逐灯优化器。
 - Stage C 先固定灯光和输入材质，只优化 32×16 far-field HDRI。
-- Stage D 冻结局部灯和优化后的 HDRI，只将选定的 ARM 张量交给 Adam。
-- 默认 target 改为 ILE JSON 中记录的原始输入图；`target.png` 只用于预览，不参与 loss。
-- 材质优化参考 `inverse_img_w_mi_ori.py`：显示空间自适应 MSE + L1、相对输入材质的 L1 prior、Adam/StepLR 和相对改进式 early stopping。
+- Stage D 冻结局部灯和优化后的 HDRI，只优化当前阶段选定的 ARM 通道；参数可以是逐像素张量或 PosMLP 权重。
+- 新增 `--model_name {none,pos_mlp}`：默认 `none` 保留现有逐像素优化；`pos_mlp` 同时用于 HDRI 和材质优化。
+- PosMLP HDRI 使用球面坐标，ARM 使用图像 UV 坐标；loss、约束、阶段顺序、checkpoint 和最终输出格式与逐像素分支一致。
+- PosMLP HDRI 输出层会匹配 `--farfield-init`，并通过 PyTorch ↔ Mitsuba/Dr.Jit 可微桥回传渲染梯度；该模式需要 CUDA。
+- 显式 `--target` 优先；否则新版完整 inference manifest 使用同工作分辨率的线性 `gt_image.exr`，旧结果回退 ILE JSON 原始图；`target.png` 只用于预览，不参与 loss。
+- 材质优化参考 `inverse_img_w_mi_ori.py`：显示空间自适应 MSE + L1、相对输入材质的 L1 prior、StepLR 等价调度和相对改进式 early stopping；逐像素使用 Adam，PosMLP 使用 AdamW。
 - detached mean-exposure matching 改为显式 opt-in，默认关闭，以保证训练目标和最终物理渲染亮度一致。
 - Stage C 的回退与 candidate/selected 多份 HDRI 已移除；唯一的优化 HDRI 会被重新加载并固定用于 ARM 阶段。
 - manifest 记录 HDRI 重载误差和材质优化期间的冻结误差，两者必须为 0；ARM 仍保留同 seed 高 SPP validation gate。
-- 默认材质顺序改为 `rm -> a`：先联合优化 roughness/metallic 并恢复该阶段最优 checkpoint，再冻结 RM、单独优化 albedo；每阶段使用独立 Adam/StepLR、early stopping 和输入材质 prior。
+- 默认材质顺序改为 `rm -> a`：先联合优化 roughness/metallic 并恢复该阶段最优 checkpoint，再冻结 RM、单独优化 albedo；每阶段使用独立 optimizer、学习率调度、early stopping 和输入材质 prior。
 - `material_phase_summaries.json` 记录阶段顺序、最优 MSE 与冻结通道误差；实测 RM 阶段的 albedo 和 A 阶段的 roughness/metallic 最大变化均为 0。仍可通过 `--material-order` 做顺序消融，旧 `--material-channels` 仅作为单阶段兼容选项。首轮固定 mesh normal，不优化 normal map。
 - 输出优化 HDRI、ARM EXR/PNG、两阶段 history、阶段渲染和统一 manifest。
 
@@ -114,7 +117,7 @@ Materialist mesh + Materialist BRDF + ILE lamps
 ### 数值与接口验证
 
 - 本次新增优化入口已通过 `py_compile`；本次维护的入口与文档已通过定向 `git diff --check`。
-- 颜色、MoGe、mesh 与 Hybrid 的 14 个单元测试全部通过，其中包括：
+- 颜色、MoGe、mesh、Hybrid 与 PosMLP 数值稳定性的 16 个单元测试全部通过，其中包括：
   - 相机中心投影；
   - `+X` 投向图像右侧；
   - `+Y` 投向图像上方；
@@ -143,9 +146,11 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - 2-step Stage C smoke test 成功，loss 由约 0.3861 降至 0.3199。
 - smoke test 导出的 far-field EXR/HDR 均为 `(16, 32, 3)`、全有限值。
 - 固定灯光的顺序优化 smoke test 成功：2-step Stage C 后按 2-step RM、2-step A 执行，两个材质阶段的冻结通道误差、HDRI 重载误差及材质阶段 HDRI 变化量均为 0。
+- PosMLP 2-step smoke test 成功：far-field display MSE 从约 `0.166886` 降至 `0.164928`，RM 网络产生有效更新；导出的 HDRI/ARM/render 全有限，材质阶段 HDRI 变化量为 0。
+- Torch sRGB 在零亮度处的梯度发散已修复，并增加有限梯度回归测试。
 - 已确认旧 `hybrid_ile_farfield_material_opt/` 使用了错误的双重 gamma target，不能作为有效结果基线。
 - 修正版 `target.png` 与 ILE 原始 `im.png` 像素级一致；正式 v2 实验关闭曝光对齐并通过 validation gate。
-- Stage C 直接 32×16 tensor 在高 SPP validation 上仍可能退化；v5 仍按实验定义把训练选出的唯一 best HDRI 交给顺序材质阶段，同时保留 metrics 供判断，后续需要更强平滑参数化或方差降低。
+- Stage C 直接 32×16 tensor 在高 SPP validation 上仍可能退化；v6 保留该逐像素基线并新增 PosMLP 平滑参数化，两者都会把训练选出的唯一 best HDRI 交给顺序材质阶段并保留 metrics，后续需通过正式实验比较并继续降低方差。
 - 重建优先 ARM 设置将 validation PSNR 从约 13.797 dB 提升到 13.954 dB，三种材质平均变化约 0.010–0.016。
 
 当前结果目录：
@@ -187,6 +192,7 @@ radiance_i = exp(alpha_i) * ile_rgb_i
 计划实现：
 
 - 完成 300 次以上正式优化并调节初始化、学习率、TV 和 energy 权重。
+- 在相同 seed、迭代数和 loss 下对比 `--model_name none` 与 `pos_mlp` 的收敛、平滑性及高 SPP validation。
 - 分别输出 local-only、farfield-only 和 combined contribution。
 - 检查 HDRI 是否出现高频热点、边界断裂或吞掉 local lamps。
 - 比较 constant ambient 与 32×16 HDRI，判断是否需要保留更简单的中间阶段。
@@ -200,6 +206,7 @@ radiance_i = exp(alpha_i) * ile_rgb_i
 后续工作：
 
 - 使用 500 次以上正式迭代，检查 best checkpoint 和各材质通道的变化。
+- 对比逐像素与 PosMLP 的材质细节保持、空间平滑先验和最终重建误差。
 - 调节 `material-prior-weight`，并比较开启/关闭曝光对齐。
 - 分别执行 `r`、`m`、`rm`、`rm -> a` 和单阶段 `arm` 消融，观察顺序及光照—材质歧义。
 - 增加材质边缘保持或低频正则前，先评估原始 Materialist loss 的基线。
