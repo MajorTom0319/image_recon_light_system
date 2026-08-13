@@ -11,7 +11,7 @@ import numpy as np
 
 @dataclass(slots=True)
 class MeshAreaLight:
-    """An ILE lamp represented by an emissive triangle mesh."""
+    """An ILE lamp or window represented by an emissive triangle mesh."""
 
     id: int
     light_type: str
@@ -22,6 +22,7 @@ class MeshAreaLight:
     geometry_scale: float = 1.0
     confidence: float = 1.0
     mask_path: Path | None = None
+    window_lobes: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.id = int(self.id)
@@ -32,8 +33,15 @@ class MeshAreaLight:
         self.confidence = float(self.confidence)
         if self.mask_path is not None:
             self.mask_path = Path(self.mask_path)
+        if self.window_lobes is not None:
+            self.window_lobes = np.asarray(self.window_lobes, dtype=np.float32)
 
-        if self.light_type not in {"visible_lamp", "invisible_lamp"}:
+        if self.light_type not in {
+            "visible_lamp",
+            "invisible_lamp",
+            "visible_window",
+            "invisible_window",
+        }:
             raise ValueError(f"Unsupported light type: {self.light_type}")
         if not np.isfinite(self.center).all():
             raise ValueError(f"Light {self.name} has a non-finite center")
@@ -43,6 +51,23 @@ class MeshAreaLight:
             raise ValueError("geometry_scale must be finite and positive")
         if not self.geometry_path.is_file():
             raise FileNotFoundError(self.geometry_path)
+        if self.is_window:
+            if self.window_lobes is None or self.window_lobes.shape != (3, 7):
+                raise ValueError(
+                    f"Window {self.name} needs sun/sky/ground lobes with shape (3, 7)"
+                )
+            if not np.isfinite(self.window_lobes).all():
+                raise ValueError(f"Window {self.name} has non-finite SG parameters")
+            if np.any(self.window_lobes[:, :3] < 0):
+                raise ValueError(f"Window {self.name} has negative SG radiance")
+            direction_norms = np.linalg.norm(self.window_lobes[:, 3:6], axis=1)
+            if np.any(direction_norms <= 1e-8):
+                raise ValueError(f"Window {self.name} has a zero SG direction")
+            self.window_lobes[:, 3:6] /= direction_norms[:, None]
+            if np.any(self.window_lobes[:, 6] < 0):
+                raise ValueError(f"Window {self.name} has negative SG concentration")
+        elif self.window_lobes is not None:
+            raise ValueError(f"Lamp {self.name} cannot contain window SG parameters")
 
     @property
     def name(self) -> str:
@@ -51,6 +76,10 @@ class MeshAreaLight:
     @property
     def scaled_center(self) -> np.ndarray:
         return self.center * self.geometry_scale
+
+    @property
+    def is_window(self) -> bool:
+        return self.light_type.endswith("_window")
 
 
 @dataclass(slots=True)

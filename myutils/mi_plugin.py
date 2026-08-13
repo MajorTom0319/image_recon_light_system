@@ -1577,30 +1577,35 @@ class MatDiffBSDF(mi.BSDF):
         return x, y
     
     def eval(self, ctx, si, wo, active):
-        wo = si.to_world(wo)
-        wi = si.to_world(si.wi)
+        light_dir = si.to_world(wo)
+        view_dir = si.to_world(si.wi)
         normal = si.n
         position = si.p
         screen_coor = mi_world_to_screen(position,self.view_matrix,self.persp_proj_matx,self.width,self.height)
-        brdf,_ = self.eval_brdf(wi, wo, normal, self.mat, screen_coor)
+        brdf,_ = self.eval_brdf(light_dir, view_dir, normal, self.mat, screen_coor)
 
         return brdf
 
     def pdf(self, ctx, si, wo,active):
-        wo = si.to_world(wo)
-        wi = si.to_world(si.wi)
+        light_dir = si.to_world(wo)
+        view_dir = si.to_world(si.wi)
 
         normal = si.n
         position = si.p
 
         screen_coor = mi_world_to_screen(position,self.view_matrix,self.persp_proj_matx,self.width,self.height)
 
-        _,pdf = self.eval_brdf(wi, wo, normal, self.mat, screen_coor)
+        _,pdf = self.eval_brdf(light_dir, view_dir, normal, self.mat, screen_coor)
 
         return pdf
 
     def eval_brdf(self, wi, wo, normal_mesh, mat, screen_coor):
-        """ Evaluate BRDF and PDF """
+        """Evaluate Mitsuba's ``f * cos(theta_o)`` value and sampling PDF.
+
+        ``wi`` is the sampled light direction and ``wo`` is the view direction,
+        both expressed in world coordinates. Keeping this order consistent is
+        required for the diffuse PDF and direct-light MIS to agree.
+        """
         albedo = self.a
         roughness = self.r
         metallic = self.m
@@ -1651,7 +1656,9 @@ class MatDiffBSDF(mi.BSDF):
             brdf_diff = kd / math.pi
             brdf_spec = D * G * F / 4.0
             brdf = brdf_diff + brdf_spec
-        return brdf, pdf
+        # Mitsuba BSDF.eval() and BSDF.sample() use the projected BRDF
+        # f(wi, wo) * cos(theta_light), not the unprojected BRDF alone.
+        return brdf * NoL, pdf
 
     def sample(self, ctx, si, sample1, sample2, active):
 
@@ -1668,7 +1675,8 @@ class MatDiffBSDF(mi.BSDF):
         bs.pdf = pdf_mi
         bs.sampled_component = mi.UInt32(0)
         bs.sampled_type = mi.UInt32(+self.m_flags)
-        bs.wo = wo
+        # BSDFSample3f.wo must be expressed in the local shading frame.
+        bs.wo = si.to_local(wo)
         bs.eta = 1.0
         return (bs,value_mi)
 

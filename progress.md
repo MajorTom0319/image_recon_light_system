@@ -1,8 +1,8 @@
 # Materialist 当前实施进展
 
-更新时间：2026-08-11
+更新时间：2026-08-12
 
-当前阶段：相机、MoGe2 metric geometry、MatNet 材质和 IndoorLightEditing 显式灯光已经接入同一 Mitsuba 场景。Example1 已完成 local-only、visible-only 和 invisible-only 渲染；Stage B 逐灯 scale、Stage C 32×16 far-field HDRI，以及“关闭 Stage B，HDRI 后优化 ARM 材质”的分阶段主流程均已实现。固定灯光入口现同时支持逐像素和 PosMLP 两种参数化，并已通过最小 GPU smoke test。下一步进行正式迭代、超参数调节和两种参数化的结果评估。
+当前阶段：相机、MoGe2 metric geometry、MatNet 材质和 IndoorLightEditing 显式灯光已经接入同一 Mitsuba 场景。固定灯光入口现会加载 visible/invisible lamp 与 visible/invisible window：lamp 使用普通 mesh area emitter，window 使用保留 ILE sun/sky/ground 三球面高斯的方向性有限面 emitter。Stage B 逐灯 scale 仍保持 lamp-only；Stage C 32×16 far-field HDRI 和“关闭 Stage B，固定全部 ILE 灯光后优化 ARM”的主流程均已实现。逐像素与 PosMLP 两种参数化、LLVM/CUDA 可微链路和窗口单独贡献均已通过 smoke test。下一步应重新进行包含 window 的正式优化和消融评估。
 
 ## 当前数据链路
 
@@ -13,9 +13,12 @@
   └── IndoorLightEditing
         ← 同一份 MoGe depth.npy
         → visible/invisible lamp mesh + center + RGB
+        → visible/invisible window mesh + center
+        → window sun/sky/ground [RGB, direction, concentration]
 
-Materialist mesh + Materialist BRDF + ILE lamps
-  → Mitsuba area emitters
+Materialist mesh + Materialist BRDF + ILE local lights
+  → lamp: Mitsuba area emitter
+  → window: ILE directional SG mesh emitter
   → local / env / combined PBR rendering
 ```
 
@@ -29,16 +32,16 @@ Materialist mesh + Materialist BRDF + ILE lamps
 | ILE depth 输入 | 已完成 | 输出原图尺寸、稠密、有限、正值的 `float32 depth.npy`，与 mesh 使用相同的 MoGe depth source |
 | Mesh 重建 | 已集成 | 使用工作分辨率 K 和 metric depth，每次推理强制重建；0-depth/mask sentinel 已修复 |
 | 相机元数据 | 已集成 | `camera_meta.json` 由 mesh、Mitsuba sensor 和 Materialist BSDF 共用，并正确记录 MoGe2/GeoCalib 来源 |
-| ILE 灯光 JSON/OBJ | 已接入 | 解析 visible/invisible lamp center、RGB、geometry 和可选 depth scale |
-| ILE → Mitsuba 灯光 | Prototype 已跑通 | lamp OBJ 作为 Mitsuba area emitter 加载；window 暂不接入 |
-| Hybrid 渲染入口 | 已实现 | 支持 `local`、`env`、`combined`、dry-run 和 visible/invisible 消融 |
+| ILE 灯光 JSON/OBJ | 已接入 | 解析 visible/invisible lamp 与 window 的 center、geometry、mask、radiance 参数和可选 depth scale |
+| ILE → Mitsuba 灯光 | 已跑通 | lamp OBJ 使用普通 area emitter；window OBJ 使用 sun/sky/ground 三 SG 方向 emitter |
+| Hybrid 渲染入口 | 已实现 | 通用入口保持 lamp-only，支持 `local`、`env`、`combined`、dry-run 和 visible/invisible 消融 |
 | Hybrid 调试输出 | 已实现 | 输出灯光投影、mask overlay、raw EXR、OptiX 去噪图和 manifest |
 | HDRI / 原始 envmap 流程 | 已有 | 保留 Materialist 原环境光优化、HDRI 重渲染和旋转能力 |
 | 灯光强度 refinement | 主流程已实现 | 固定几何/材质/灯几何/色度，每盏灯只优化 scalar radiance scale |
 | 32×16 far-field HDRI | 主流程已实现 | 固定 Stage B 局部灯，优化非负低频 envmap，并加入能量和球面 TV 正则 |
-| 固定灯光下的 ARM refinement | 主流程已实现 | 可跳过 Stage B，先优化 HDRI，再固定全部光照优化输入 albedo/roughness/metallic |
+| 固定灯光下的 ARM refinement | 主流程已实现 | 跳过 Stage B，固定全部 lamp/window，先优化 HDRI，再固定全部光照优化 albedo/roughness/metallic |
 | Local + far-field 联合 refinement | 待实现 | 当前采用分阶段冻结策略，尚未进行最后的小步联合优化 |
-| 自动化测试 | 初步建立 | 已有 14 个颜色、HDR、坐标、mask、mesh、尺度和 JSON 回归测试 |
+| 自动化测试 | 初步建立 | 已有 21 个颜色、HDR、坐标、mask、mesh、尺度、JSON、window SG 与 validation gate 回归测试 |
 
 ## 已完成实现
 
@@ -71,10 +74,12 @@ Materialist mesh + Materialist BRDF + ILE lamps
 
 - 新增 `hybrid_light/`，分离数据类型、JSON 读取、坐标转换、Mitsuba scene 构建和可视化。
 - 直接复用 ILE 导出的 visible/invisible lamp OBJ，比重新估计 rectangle 更忠实于当前预测结果。
+- 固定灯光入口同时复用 visible/invisible window OBJ，并完整读取 `src`、`srcSky`、`srcGrd` 三组 `[RGB, direction xyz, concentration]`。
+- 新增 `hybrid_light/ile_window_emitter.py`。窗口辐射度按 `Σ RGB_k exp(λ_k(min(dot(d_k,ω)-1,0)))` 求和，保留 sun/sky/ground 的方向性，不简化为 uniform rectangle。
 - 当前坐标统一为 `+X right、+Y up、-Z forward`；转换函数即使当前为 identity 也保留独立接口。
 - 如果 JSON 标记 depth normalization，center 和整个 light mesh 会同步乘 `depth_scale`。
 - visible lamp 默认朝相机平移 0.005 m，降低与单视图 scene mesh 共面的风险。
-- ILE RGB 作为相对 radiance 初值，并提供全局 `--radiance-scale` 校准入口。
+- ILE lamp RGB 与 window 三组 RGB 都作为相对 radiance 初值，并由同一个全局 `--radiance-scale` 校准；window direction 和 concentration 不随该 scale 改变。
 
 ### 5. Hybrid renderer
 
@@ -97,19 +102,21 @@ Materialist mesh + Materialist BRDF + ILE lamps
 ### 7. 关闭 Stage B 的 HDRI + ARM 优化入口
 
 - 新增 `scripts/optimize_ile_farfield_materials.py`，与已有优化入口相互独立。
-- ILE lamp RGB 只乘固定的全局 `--radiance-scale`，整个实验不创建逐灯优化器。
-- Stage C 先固定灯光和输入材质，只优化 32×16 far-field HDRI。
-- Stage D 冻结局部灯和优化后的 HDRI，只优化当前阶段选定的 ARM 通道；参数可以是逐像素张量或 PosMLP 权重。
+- 该入口调用 `load_ile_lights(..., include_windows=True)`，自动加载 visible/invisible lamp 和 visible/invisible window，无需增加命令行参数。
+- Lamp RGB 与 window sun/sky/ground RGB 只乘固定的全局 `--radiance-scale`，整个实验不创建逐灯或逐窗口优化器。
+- Stage C 固定全部 ILE lamp/window 和输入材质，只优化 32×16 far-field HDRI。
+- Stage D 冻结 lamp、window 和优化后的 HDRI，只优化当前阶段选定的 ARM 通道；参数可以是逐像素张量或 PosMLP 权重。
 - 新增 `--model_name {none,pos_mlp}`：默认 `none` 保留现有逐像素优化；`pos_mlp` 同时用于 HDRI 和材质优化。
 - PosMLP HDRI 使用球面坐标，ARM 使用图像 UV 坐标；loss、约束、阶段顺序、checkpoint 和最终输出格式与逐像素分支一致。
 - PosMLP HDRI 输出层会匹配 `--farfield-init`，并通过 PyTorch ↔ Mitsuba/Dr.Jit 可微桥回传渲染梯度；该模式需要 CUDA。
 - 显式 `--target` 优先；否则新版完整 inference manifest 使用同工作分辨率的线性 `gt_image.exr`，旧结果回退 ILE JSON 原始图；`target.png` 只用于预览，不参与 loss。
 - 材质优化参考 `inverse_img_w_mi_ori.py`：显示空间自适应 MSE + L1、相对输入材质的 L1 prior、StepLR 等价调度和相对改进式 early stopping；逐像素使用 Adam，PosMLP 使用 AdamW。
 - detached mean-exposure matching 改为显式 opt-in，默认关闭，以保证训练目标和最终物理渲染亮度一致。
-- Stage C 的回退与 candidate/selected 多份 HDRI 已移除；唯一的优化 HDRI 会被重新加载并固定用于 ARM 阶段。
-- manifest 记录 HDRI 重载误差和材质优化期间的冻结误差，两者必须为 0；ARM 仍保留同 seed 高 SPP validation gate。
+- Stage C 训练候选与最终选中 HDRI 分开保存；只有通过高 SPP gate 的候选才成为权威 HDRI，否则恢复初始 HDRI。最终选中 HDRI 会被重新加载并固定用于 ARM 阶段。
+- Stage C 与 ARM 都使用同 seed、高 SPP validation gate。若候选 HDRI 的 display MSE 劣于初始 HDRI，则恢复初始 HDRI作为权威 EXR 和 Stage D 输入，同时保留 `farfield_candidate_combined.*` 供诊断；manifest 还记录 HDRI 重载误差和材质优化期间的冻结误差，两者必须为 0。
 - 默认材质顺序改为 `rm -> a`：先联合优化 roughness/metallic 并恢复该阶段最优 checkpoint，再冻结 RM、单独优化 albedo；每阶段使用独立 optimizer、学习率调度、early stopping 和输入材质 prior。
 - `material_phase_summaries.json` 记录阶段顺序、最优 MSE 与冻结通道误差；实测 RM 阶段的 albedo 和 A 阶段的 roughness/metallic 最大变化均为 0。仍可通过 `--material-order` 做顺序消融，旧 `--material-channels` 仅作为单阶段兼容选项。首轮固定 mesh normal，不优化 normal map。
+- `optimization_manifest.json` 新增 `fixed_local_lights`、`fixed_window_count` 和 `fixed_local_radiance_scale`，可以确认正式运行是否确实包含全部 ILE 灯光。
 - 输出优化 HDRI、ARM EXR/PNG、两阶段 history、阶段渲染和统一 manifest。
 
 ## 已完成验证
@@ -117,12 +124,12 @@ Materialist mesh + Materialist BRDF + ILE lamps
 ### 数值与接口验证
 
 - 本次新增优化入口已通过 `py_compile`；本次维护的入口与文档已通过定向 `git diff --check`。
-- 颜色、MoGe、mesh、Hybrid 与 PosMLP 数值稳定性的 16 个单元测试全部通过，其中包括：
+- 颜色、MoGe、mesh、Hybrid、window SG、validation gate 与 PosMLP 数值稳定性的 21 个单元测试全部通过，其中包括：
   - 相机中心投影；
   - `+X` 投向图像右侧；
   - `+Y` 投向图像上方；
   - 3D→2D→3D round-trip；
-  - depth scale 和 JSON 读取。
+  - depth scale、lamp/window JSON 读取和三组 SG 参数校验。
 - 8-bit/16-bit PNG sRGB→linear→PNG 往返、float HDR 不除以 255、非透明 alpha 拒绝策略均已验证。
 - MoGe normal/points 的 `Rx(180°)` 坐标变换、mask-aware resize 和 normal 单位化均已验证。
 - 0-depth synthetic case 已验证不会被 mesh 三角形引用。
@@ -138,8 +145,11 @@ Materialist mesh + Materialist BRDF + ILE lamps
 - Example1 已于 2026-08-10 全量重建：`gt_image.exr` 与原图标准 linear RGB 完全一致，`gt_image.png` 与原 PNG 逐像素一致。
 - 重建后的 albedo/roughness/metallic 全部有限并处于合法范围；MoGe camera/materialist vector 变换误差为 0，mesh 重投影最大误差小于 `1e-12 px`。
 - 修正后的 MoGe predicted normal 已通过独立 2 spp Mitsuba smoke render：输出全有限、非黑屏，约 53.5% 像素在该低采样下获得非零 local-light contribution。
-- 成功加载 1 个 visible lamp 和 1 个 invisible lamp。
+- Lamp-only 入口成功加载 1 个 visible lamp 和 1 个 invisible lamp；固定灯光优化入口成功加载这两个 lamp，以及 1 个 visible window 和 1 个 invisible window，共 4 个 local lights。
 - local-only、visible-only、invisible-only 均得到有效非空照明。
+- 真实 Example1 window 参数已验证为三组有限 `(3, 7)` SG；方向向量在 loader 中归一化，负 radiance、零方向或负 concentration 会被拒绝。
+- 16×16、16 spp 的独立消融中，visible window、invisible window 和两者组合均得到有限非黑结果；非零像素比例分别约为 48.8%、97.7% 和 94.9%。
+- 使用真实四灯场景的 LLVM AD 与 `cuda_ad_rgb` 轻量 smoke test 均得到全有限渲染，并对材质参数产生有限、非零梯度，说明 window emitter 没有阻断 Stage C/D 可微链路。
 - 64 spp local-only raw EXR 全部为有限值，约 98.6% 像素获得非零贡献。
 - 已生成 OptiX 去噪后的可视化结果。
 - 2-step Stage B smoke test 成功，visible/invisible scale 均收到梯度并更新。
@@ -236,7 +246,9 @@ radiance_i = exp(alpha_i) * ile_rgb_i
 
 ### 后续研究扩展
 
-- ILE window 的 sun/sky/ground 方向性表示适配。
+- 对高 concentration sun lobe 增加方向 importance sampling，降低当前均匀窗口位置采样的方差。
+- 增加 lamp-only、window-only、lamp+window、lamp+window+far-field 的正式高 SPP 消融。
+- 研究是否需要在 Stage B 中为 window 三组 SG 增加共享或分组 radiance scale；当前固定灯光入口不优化 window 参数。
 - light position、orientation 和 size 的有限范围优化。
 - 更可靠的 visible lamp 双面/定向发光表示。
 - 多视角或补全几何，以改善画面外灯光的遮挡和多次反射。
@@ -245,10 +257,11 @@ radiance_i = exp(alpha_i) * ile_rgb_i
 ## 已知限制与风险
 
 - ILE RGB intensity 与 Mitsuba radiance 尚未建立物理单位映射。
-- 当前只支持 lamp；window 不应直接简化为 uniform rectangle。
-- Mitsuba area emitter 为单面发光；当前样例通过消融验证，但新场景仍需检查 OBJ winding。
+- 固定灯光入口已支持 window，但 Stage B 和通用 renderer 仍默认 lamp-only；不能把 window 三组方向参数直接压成 uniform RGB rectangle。
+- Lamp area emitter 与 window emitter 都按 OBJ winding 单面发光；当前样例通过消融验证，但新场景仍需检查法线朝向。
+- Window emitter 保留 SG 辐射度，但目前仍均匀采样窗口孔径，没有专门 importance sample 很尖锐的 sun lobe，因此高 concentration 窗口可能需要更多 SPP。
 - 可见灯 mesh 可能与 Materialist 单视图 mesh 接近共面，目前只通过小幅 offset 缓解。
 - 单视图 mesh 不是封闭房间，画面外 invisible lamp 的遮挡和间接光只能近似表达。
-- local-only 不包含窗外和远场照明，因此整体亮度低于输入并不一定是坐标错误。
+- 即使加入显式 window，local-only 仍不包含完整画外远场和 neural indirect illumination，因此整体亮度低于输入并不一定是坐标错误。
 - 主渲染和自定义 Materialist BSDF 仍依赖 CUDA；部分路径与模型权重依赖本机环境。
 - 单图逆渲染存在材质、几何、曝光和光照间的固有歧义。

@@ -13,8 +13,9 @@ Materialist 是一个面向单张室内图像的逆渲染、重新打光与材�
         Materialist 分支                    IndoorLightEditing 分支
         ├── MoGe2 相机/K                    ├── visible lamp
         ├── MoGe2 metric depth              ├── invisible lamp
-        ├── mesh 重建                       ├── 灯光 mesh/center
-        └── MatNet 材质                     └── RGB intensity
+        ├── mesh 重建                       ├── visible window
+        └── MatNet 材质                     ├── invisible window
+                                            └── mesh/center + radiance 参数
                │                                   │
                └─────────────────┬─────────────────┘
                                  ▼
@@ -34,8 +35,9 @@ Materialist 负责场景几何和 BRDF，IndoorLightEditing 作为显式灯光 p
 - 使用 MoGe2 恢复 metric depth、normal、points、有效 mask 和相机内参。
 - 使用统一工作分辨率和相机 K 将深度反投影为 Materialist mesh。
 - 为 IndoorLightEditing 输出原图尺寸、稠密、有限的 `float32 depth.npy`。
-- 读取 IndoorLightEditing 导出的 `light_predictions.json` 和 lamp OBJ。
+- 读取 IndoorLightEditing 导出的 `light_predictions.json`、lamp OBJ 和 window OBJ。
 - 将 visible/invisible lamp 转换为 Mitsuba area emitter。
+- 在固定灯光优化入口中，将 visible/invisible window 转换为保留 sun/sky/ground 三组方向球面高斯的可微 Mitsuba emitter。
 - 使用 Materialist mesh 和逐像素 BRDF 进行 local-only、env-only 或 combined 渲染。
 - 输出灯光投影诊断、raw EXR、OptiX 去噪结果和渲染 manifest。
 - 保留原有环境光优化、HDRI 重渲染、材质编辑和离散灯光实验能力。
@@ -56,21 +58,22 @@ mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定，mesh builder �
 
 | 文件 | 功能 |
 | --- | --- |
-| `hybrid_light/light_types.py` | 定义统一的 mesh area light 和灯光集合数据结构 |
-| `hybrid_light/io.py` | 解析并校验 ILE JSON、灯光中心、RGB、OBJ 路径和 depth scale |
+| `hybrid_light/light_types.py` | 定义统一的 lamp/window mesh light、三组 window SG 参数和灯光集合数据结构 |
+| `hybrid_light/io.py` | 解析并校验 ILE JSON、lamp RGB、window sun/sky/ground、OBJ 路径和 depth scale |
 | `hybrid_light/coordinate.py` | 封装 ILE → Materialist 坐标、3D→2D 投影和反投影 |
-| `hybrid_light/mitsuba_builder.py` | 构造 Materialist mesh、相机、ILE area emitter 和可选 envmap 场景 |
-| `hybrid_light/visualization.py` | 将灯光中心、OBJ 投影轮廓和 lamp mask 绘制到输入图像 |
+| `hybrid_light/ile_window_emitter.py` | ILE 有限窗口 emitter：按出射方向计算 sun/sky/ground 三球面高斯辐射度 |
+| `hybrid_light/mitsuba_builder.py` | 构造 Materialist mesh、相机、lamp area emitter、directional window emitter 和可选 envmap 场景 |
+| `hybrid_light/visualization.py` | 将灯光中心、OBJ 投影轮廓和 lamp/window mask 绘制到输入图像 |
 | `hybrid_light/README.md` | Hybrid prototype 的运行方式和当前约束 |
 | `scripts/render_ile_lights.py` | 初版融合渲染入口，支持验证、消融和三种光照模式 |
 | `scripts/optimize_ile_farfield.py` | Stage B 逐灯 scale 优化，以及 Stage C 32×16 far-field HDRI 优化入口 |
-| `scripts/optimize_ile_farfield_materials.py` | 关闭 Stage B、固定 ILE 灯强度，支持逐像素或 PosMLP 参数化，依次优化 Stage C far-field HDRI、Stage D roughness/metallic，最后优化 albedo |
-| `tests/test_hybrid_light.py` | 坐标方向、投影 round-trip、尺度同步和 JSON 读取测试 |
+| `scripts/optimize_ile_farfield_materials.py` | 关闭 Stage B、固定全部 ILE lamp/window，支持逐像素或 PosMLP 参数化，依次优化 Stage C far-field HDRI、Stage D roughness/metallic，最后优化 albedo |
+| `tests/test_hybrid_light.py` | 坐标方向、投影 round-trip、尺度同步、lamp/window JSON 和 SG 参数测试 |
 | `materialist_indoorlightediting_hybrid_method.md` | 完整方法设计、阶段规划和实验建议 |
 
 ## Hybrid 渲染模式
 
-`scripts/render_ile_lights.py` 支持：
+通用 `scripts/render_ile_lights.py` 目前保持原有 lamp-only 默认语义，支持：
 
 - `--mode local`：只使用 ILE visible/invisible lamps。
 - `--mode env`：只使用给定的 environment map。
@@ -85,7 +88,7 @@ mesh 使用的 MoGe2 depth 保留“无效值为 0”的约定，mesh builder �
 
 逐灯与 far-field 优化使用独立入口 `scripts/optimize_ile_farfield.py`。Stage B 保持 ILE RGB 色度不变，只优化每盏灯的非负 scalar scale；Stage C 固定局部灯，优化内部形状为 `(16, 32, 3)` 的 HDR envmap，并加入能量与球面周期 TV 正则。
 
-固定灯光实验使用 `scripts/optimize_ile_farfield_materials.py`：完全跳过 Stage B，先固定 ILE radiance 优化 HDRI，再冻结全部光照，默认先联合优化 roughness/metallic 并冻结最优结果，最后单独优化 albedo。`--model_name none` 保留逐像素优化，`--model_name pos_mlp` 使用 Materialist PosMLP 同时参数化球面 HDRI 和 UV 空间 ARM；两者共享 loss、顺序、checkpoint、冻结检查与输出格式。每个材质阶段使用独立优化器与 early stopping，并检查未参与该阶段的材质通道严格不变。新版完整 inference manifest 优先使用同工作分辨率的线性 `gt_image.exr`，旧结果回退 ILE JSON 原始图；材质 loss 参考 `inverse_img_w_mi_ori.py` 的显示空间 MSE/L1 和输入材质先验，曝光对齐为可选。Stage C 只输出一份权威的 `farfield_optimized_32x16.exr/.hdr`，Stage D 会从该 EXR 重新建场景，并校验材质优化前后 env tensor 完全不变。
+固定灯光实验使用 `scripts/optimize_ile_farfield_materials.py`：完全跳过 Stage B，默认从同一份 JSON 加载 visible/invisible lamp 和 visible/invisible window。Lamp 保持原始 mesh area radiance；window 保持有限 OBJ 孔径，并按 `src/srcSky/srcGrd` 的 `[RGB, direction, concentration]` 参数计算方向辐射度。全部 ILE 局部灯只统一乘固定 `--radiance-scale`，Stage C 只优化 HDRI；随后 Stage D 冻结 lamp、window 和 HDRI，默认先联合优化 roughness/metallic 并冻结最优结果，最后单独优化 albedo。`--model_name none` 保留逐像素优化，`--model_name pos_mlp` 使用 Materialist PosMLP 同时参数化球面 HDRI 和 UV 空间 ARM；两者共享 loss、顺序、checkpoint、冻结检查与输出格式。每个材质阶段使用独立优化器与 early stopping，并检查未参与该阶段的材质通道严格不变。新版完整 inference manifest 优先使用同工作分辨率的线性 `gt_image.exr`，旧结果回退 ILE JSON 原始图；材质 loss 参考 `inverse_img_w_mi_ori.py` 的显示空间 MSE/L1 和输入材质先验，曝光对齐为可选。Stage C 只输出一份权威的 `farfield_optimized_32x16.exr/.hdr`，Stage D 会从该 EXR 重新建场景，并校验材质优化前后 env tensor 完全不变。
 
 ## 其他主要入口
 
@@ -112,9 +115,10 @@ Materialist run 目录通常为 `output_imgs/<save_name>/`，包括：
 ILE bridge 输入包括：
 
 - `light_predictions.json`。
-- `visLampPred_*.obj`、`invLampPred_*.obj`。
+- `visLampPred_*.obj`、`invLampPred_*.obj`、`visWinPred_*.obj`、`invWinPred_*.obj`。
 - visible/invisible lamp 的中心和 RGB intensity。
-- 可选的 lamp mask、相机和 depth scale 元数据。
+- visible/invisible window 的 center、OBJ，以及 `src/srcSky/srcGrd` 三组 `[RGB, direction xyz, concentration]`。
+- 可选的 lamp/window mask、相机和 depth scale 元数据。
 
 Hybrid 输出默认位于 `<materialist-dir>/hybrid_ile_render/`：
 
@@ -127,4 +131,4 @@ Hybrid 输出默认位于 `<materialist-dir>/hybrid_ile_render/`：
 
 项目主要面向 Python 3.10、PyTorch、CUDA、Mitsuba 3、Dr.Jit、Open3D、OpenCV 和 NumPy。MatNet 权重通过 Hugging Face 获取；MoGe2、GeoCalib 和 IndoorLightEditing 使用本地源码或权重。
 
-当前 hybrid prototype 只接 lamp，不接 window 的 sun/sky/ground 方向性表示；ILE intensity 仍是 Mitsuba radiance 的相对初值；单视图 mesh 也无法完整表达画面外房间几何。因此当前实现用于验证坐标、尺度、显式灯位置和物理渲染链路，下一阶段将继续完成逐灯强度优化与受约束的 local + far-field lighting。
+当前固定灯光优化入口已经接入全部 lamp/window，并保留 window 的 sun/sky/ground 方向性表示；Stage B 逐灯强度入口和通用渲染入口仍保持 lamp-only，以避免把方向窗口错误压成单一 RGB scale。ILE intensity 仍是 Mitsuba radiance 的相对初值，window emitter 目前也采用均匀孔径位置采样而非按高集中度 sun lobe 做方向 importance sampling，因此尖锐阳光分量可能需要较高 SPP。单视图 mesh 仍无法完整表达画面外房间几何。首次使用新的 Python emitter 时，Dr.Jit/CUDA 需要进行一次 JIT 编译，后续运行可复用缓存。

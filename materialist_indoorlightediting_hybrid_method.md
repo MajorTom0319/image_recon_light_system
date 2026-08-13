@@ -6,6 +6,8 @@
 >
 > 第一阶段目标不是直接完成最终论文，而是先做出一个可运行、可调试、可定量分析的 prototype，为后续的 Hybrid Near-field + Far-field Lighting Reconstruction 打基础。
 
+> **当前实现状态（2026-08-12）**：本文档前半部分保留了最初“先完成 lamp、暂缓 window”的研究路线，作为设计演进记录；它不再代表当前代码边界。`scripts/optimize_ile_farfield_materials.py` 已经接入 visible/invisible lamp 和 visible/invisible window。Lamp 使用普通 Mitsuba mesh area emitter；window 使用有限 OBJ 孔径，并通过 `hybrid_light/ile_window_emitter.py` 保留 ILE `src/srcSky/srcGrd` 三组 `[RGB, direction, concentration]` 球面高斯。Stage B 逐灯 scale 和通用 renderer 仍默认 lamp-only。
+
 ---
 
 # 1. 方法概述
@@ -190,13 +192,14 @@ IndoorLightEditing
 Explicit 3D Light Parameters
 ```
 
-建议只提取：
+当前固定灯光优化入口提取：
 
 - visible lamp；
 - invisible lamp；
-- 后续再考虑 visible/invisible window。
+- visible window；
+- invisible window。
 
-第一版建议只做 lamp。
+历史第一版先完成 lamp；当前实现已在不改动主优化循环的前提下补齐方向性 window adapter。
 
 ---
 
@@ -403,9 +406,9 @@ Mitsuba area emitter
 
 ---
 
-# 8. Window 暂缓
+# 8. Window Adapter（当前已实现）
 
-第一版不建议接 window。
+最初版本暂缓 window，因为它的 illumination 比 lamp 更复杂；当前固定灯光入口已经完成适配。
 
 原因是 window 的 illumination 比 lamp 更复杂。
 
@@ -428,14 +431,22 @@ IndoorLightEditing 对 window 实际包含：
 
 如果直接把它压成 uniform area light，会损失原模型中的重要方向信息。
 
-因此第一阶段：
+当前实现采用：
 
 ```text
-支持 lamp
-不支持 window
+window OBJ finite aperture
++
+sun / sky / ground directional SG radiance
 ```
 
-待 lamp pipeline 稳定后，再单独增加 window adapter。
+对场景点指向窗口的方向 \(\omega\)，辐射度为：
+
+\[
+L(\omega)=\sum_{k\in\{sun,sky,ground\}}
+c_k\exp\left(\lambda_k\min(d_k\cdot\omega-1,0)\right).
+\]
+
+普通 area emitter 的 radiance texture 在直接光采样时拿不到接收方向，不能正确实现该函数。因此 `hybrid_light/ile_window_emitter.py` 覆盖 `sample_direction`、`eval_direction` 和直接命中 `eval`，窗口 OBJ 继续负责孔径、距离、遮挡和软阴影。当前 `optimize_ile_farfield_materials.py` 默认启用 window；Stage B 入口仍保持 lamp-only。
 
 ---
 
@@ -2406,7 +2417,7 @@ camera:
 lighting:
   use_visible_lamps: true
   use_invisible_lamps: true
-  use_windows: false
+  use_windows: true  # fixed-light material entry; Stage B remains lamp-only
 
   env_mode: none
 
@@ -2817,16 +2828,16 @@ Ours geometry-aware initialization
 
 ---
 
-# 88. 后续 Window Adapter
+# 88. Window Adapter 当前实现与后续优化
 
-灯 pipeline 成功后，再处理 window：
+当前已经从 ILE 读取：
 
 \[
 W_i=
 (p_i,n_i,x_i,y_i)
 \]
 
-再增加：
+并保留：
 
 ```text
 sun directional lobe
@@ -2834,17 +2845,16 @@ sky lobe
 ground lobe
 ```
 
-可以设计 Mitsuba approximation：
+当前 Mitsuba 表示为：
 
 ```text
-window rectangle
-+
-directional sun
-+
-environment sky component
+finite window OBJ
++ sun SG
++ sky SG
++ ground SG
 ```
 
-但不属于第一阶段。
+该 emitter 已通过 LLVM AD 与 CUDA AD 的有限值、非零梯度 smoke test。后续不再是“是否接入 window”，而是研究高 concentration sun lobe 的 importance sampling、window-only 消融，以及是否为三组 SG 增加受约束的 radiance refinement。
 
 ---
 
@@ -3197,16 +3207,18 @@ D(R(G,M,L),I)
 - differentiable optimization 负责 **校正灯光参数**；
 - constrained envmap 负责 **补偿全局和不可见 illumination**。
 
-第一版只做：
+历史第一版从 lamp 开始；当前固定灯光路径已经扩展为：
 
 ```text
-Lamp
+Visible/Invisible Lamp
++
+Visible/Invisible Directional Window
 +
 Coordinate Conversion
 +
-Mitsuba Area Emitter
+Mitsuba Differentiable Emitters
 +
-Intensity Optimization
+Far-field HDRI + Material Refinement
 ```
 
 这是最小、最稳、最容易调试，同时与后续论文完整方向高度一致的实现路线。

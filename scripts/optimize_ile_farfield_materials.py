@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Optimize a 32x16 far-field HDRI, then Materialist RM and albedo maps.
 
-This experiment deliberately disables Stage B: ILE lamp radiance stays fixed at
-its input RGB times ``--radiance-scale``. Stage C first optimizes only the
-far-field envmap. Stage D then freezes all lighting, jointly optimizes
+This experiment deliberately disables Stage B: ILE lamp radiance and window
+sun/sky/ground lobes stay fixed at their input values times ``--radiance-scale``.
+Stage C first optimizes only the far-field envmap. Stage D then freezes all lighting, jointly optimizes
 roughness/metallic, freezes their best checkpoint, and finally optimizes
 albedo. Its loss and per-phase optimizer follow the real-image direct material
 optimization used in ``inverse_img_w_mi_ori.py``.
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
@@ -59,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Keep ILE lamp intensities fixed, optimize a 32x16 HDRI, then "
-            "optimize Materialist roughness/metallic and finally albedo."
+            "Keep all ILE lamp/window intensities fixed, optimize a 32x16 "
+            "HDRI, then optimize Materialist roughness/metallic and albedo."
         ),
     )
     parser.add_argument("--materialist-dir", type=Path, required=True)
@@ -295,6 +296,30 @@ def image_metrics(target_linear: np.ndarray, rendered_linear: np.ndarray) -> dic
         "render_display_mean": float(np.mean(rendered)),
         "render_linear_max": float(np.max(rendered_linear)),
     }
+
+
+def select_validated_farfield(
+    *,
+    initial_storage: np.ndarray,
+    initial_render: np.ndarray,
+    initial_metrics: dict[str, float],
+    candidate_storage: np.ndarray,
+    candidate_render: np.ndarray,
+    candidate_metrics: dict[str, float],
+) -> tuple[np.ndarray, np.ndarray, dict[str, float], str]:
+    """Keep the Stage-C candidate only when same-seed validation improves MSE."""
+    initial_mse = float(initial_metrics["display_mse"])
+    candidate_mse = float(candidate_metrics["display_mse"])
+    if not np.isfinite(initial_mse):
+        raise ValueError("Initial Stage-C validation MSE must be finite")
+    if np.isfinite(candidate_mse) and candidate_mse <= initial_mse:
+        return candidate_storage, candidate_render, candidate_metrics, "optimized"
+    return (
+        initial_storage,
+        initial_render,
+        initial_metrics,
+        "initial_validation_fallback",
+    )
 
 
 def save_comparison(
@@ -966,7 +991,7 @@ def main() -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else materialist_dir / "hybrid_ile_farfield_material_opt_none_posmlp"
+        else materialist_dir / "hybrid_ile_windows_nullbsdf_farfield_material_opt_posmlp_1"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -981,7 +1006,11 @@ def main() -> None:
     width, height = [int(value) for value in camera_meta["film.size"]]
     mesh_path = _resolve_mesh(materialist_dir, args.mesh)
     material_paths = _find_material_maps(materialist_dir, args.material_dir)
-    light_set = load_ile_lights(args.lights_json, geometry_scale=args.geometry_scale)
+    light_set = load_ile_lights(
+        args.lights_json,
+        include_windows=True,
+        geometry_scale=args.geometry_scale,
+    )
 
     if light_set.image_path is not None and light_set.image_path.is_file():
         render_projection_debug(
@@ -1032,6 +1061,7 @@ def main() -> None:
     env_key = "far_field_env.data"
     if env_key not in params:
         raise KeyError(f"Combined scene is missing {env_key}")
+    farfield_initial_storage = np.asarray(params[env_key], dtype=np.float32).copy()
     farfield_validation_seed = args.seed + 100000
     farfield_initial_render = render_and_save(
         mi,
@@ -1059,14 +1089,35 @@ def main() -> None:
         mi,
         scene,
         params,
-        output_dir / "farfield_optimized_combined",
+        output_dir / "farfield_candidate_combined",
         spp=args.preview_spp,
         seed=farfield_validation_seed,
         denoise=not args.no_denoise,
     )
-    # This is the single authoritative Stage-C result. optimize_farfield()
-    # already restores params[env_key] to this best checkpoint before returning.
-    farfield_export = best_farfield[:, : args.farfield_width, :]
+    farfield_initial_metrics = image_metrics(target_linear_np, farfield_initial_render)
+    farfield_candidate_metrics = image_metrics(target_linear_np, farfield_render)
+    (
+        selected_farfield,
+        selected_farfield_render,
+        farfield_metrics,
+        farfield_selection,
+    ) = select_validated_farfield(
+        initial_storage=farfield_initial_storage,
+        initial_render=farfield_initial_render,
+        initial_metrics=farfield_initial_metrics,
+        candidate_storage=best_farfield,
+        candidate_render=farfield_render,
+        candidate_metrics=farfield_candidate_metrics,
+    )
+    selected_validation_base = output_dir / (
+        "farfield_candidate_combined"
+        if farfield_selection == "optimized"
+        else "farfield_initial_combined"
+    )
+    # Make the validation choice authoritative for the export and Stage D.
+    params[env_key] = mi.TensorXf(selected_farfield)
+    params.update()
+    farfield_export = selected_farfield[:, : args.farfield_width, :]
     farfield_exr = output_dir / "farfield_optimized_32x16.exr"
     farfield_hdr = output_dir / "farfield_optimized_32x16.hdr"
     farfield_preview = output_dir / "farfield_optimized_32x16_preview.png"
@@ -1075,14 +1126,35 @@ def main() -> None:
     farfield_preview_exposure = save_envmap_preview(
         farfield_preview, farfield_export
     )
+    save_linear_image(
+        mi,
+        output_dir / "farfield_optimized_combined",
+        selected_farfield_render,
+    )
+    for suffix in (".exr", ".png"):
+        selected_raw_path = selected_validation_base.with_name(
+            selected_validation_base.name + "_raw"
+        ).with_suffix(suffix)
+        optimized_raw_path = (
+            output_dir / "farfield_optimized_combined_raw"
+        ).with_suffix(suffix)
+        shutil.copyfile(selected_raw_path, optimized_raw_path)
     write_json(output_dir / "farfield_history.json", farfield_history)
-    farfield_initial_metrics = image_metrics(target_linear_np, farfield_initial_render)
-    farfield_metrics = image_metrics(target_linear_np, farfield_render)
     write_json(
         output_dir / "farfield_metrics.json",
         {
+            "validation_spp": args.preview_spp,
+            "validation_seed": farfield_validation_seed,
             "initial": farfield_initial_metrics,
+            "candidate": farfield_candidate_metrics,
+            "selected": farfield_metrics,
+            "selection": farfield_selection,
+            # Retained for readers of the previous metrics schema.
             "optimized": farfield_metrics,
+            "candidate_display_mse_delta": (
+                farfield_candidate_metrics["display_mse"]
+                - farfield_initial_metrics["display_mse"]
+            ),
             "display_mse_delta": (
                 farfield_metrics["display_mse"]
                 - farfield_initial_metrics["display_mse"]
@@ -1092,7 +1164,7 @@ def main() -> None:
     save_comparison(
         output_dir / "farfield_target_render_error.png",
         target_linear_np,
-        farfield_render,
+        selected_farfield_render,
     )
 
     # Rebuild Stage D from the exported best EXR. This makes the material stage
@@ -1214,7 +1286,7 @@ def main() -> None:
     )
 
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "complete",
         "stage_b_enabled": False,
         "model_name": args.model_name,
@@ -1227,6 +1299,10 @@ def main() -> None:
             "linear" if target_path.suffix.lower() in {".exr", ".hdr"} else "srgb"
         ),
         "lights_json": str(light_set.source_path),
+        "fixed_local_lights": [light.name for light in light_set.lights],
+        "fixed_window_count": light_set.metadata["windows_included"],
+        "fixed_local_radiance_scale": args.radiance_scale,
+        # Retained for compatibility with manifests from lamp-only runs.
         "fixed_lamp_radiance_scale": args.radiance_scale,
         "geometry_scale": light_set.metadata["geometry_scale"],
         "input_materials": {key: str(value) for key, value in material_paths.items()},
@@ -1237,6 +1313,12 @@ def main() -> None:
             "best_loss": farfield_best_loss,
             "best_checkpoint_value": farfield_best_loss,
             "checkpoint_metric": args.farfield_checkpoint_metric,
+            "selection": farfield_selection,
+            "validation_spp": args.preview_spp,
+            "validation_seed": farfield_validation_seed,
+            "initial_display_mse": farfield_initial_metrics["display_mse"],
+            "candidate_display_mse": farfield_candidate_metrics["display_mse"],
+            "selected_display_mse": farfield_metrics["display_mse"],
             "optimized_exr": str(farfield_exr),
             "optimized_hdr": str(farfield_hdr),
             "preview_png": str(farfield_preview),
@@ -1266,9 +1348,15 @@ def main() -> None:
             "metrics": final_metrics,
         },
         "farfield_metrics": farfield_metrics,
+        "farfield_candidate_metrics": farfield_candidate_metrics,
         "farfield_initial_metrics": farfield_initial_metrics,
     }
     write_json(output_dir / "optimization_manifest.json", manifest)
+    if farfield_selection != "optimized":
+        print(
+            "Far-field candidate failed the validation gate; selected the initial "
+            "HDRI for export and material optimization."
+        )
     if material_selection != "optimized":
         print(
             "Material candidate failed the validation gate; selected the input ARM maps "

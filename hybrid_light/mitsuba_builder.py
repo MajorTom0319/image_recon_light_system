@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from .ile_window_emitter import register_ile_window_emitter
 from .light_types import MeshAreaLight
 
 
@@ -84,6 +85,8 @@ def build_hybrid_scene_dict(
         raise ValueError(f"mode={mode!r} requires envmap_path")
     if mode == "local" and not lights:
         raise ValueError("Local-only rendering requires at least one lamp")
+    if any(light.is_window for light in lights):
+        register_ile_window_emitter(mi)
 
     scene: dict[str, Any] = {
         "type": "scene",
@@ -106,15 +109,33 @@ def build_hybrid_scene_dict(
             if suffix not in {".obj", ".ply"}:
                 raise ValueError(f"Unsupported light mesh format: {light.geometry_path}")
             rgb = np.maximum(light.rgb * np.float32(radiance_scale), 0.0)
-            scene[f"ile_{light.name}"] = {
+            if light.is_window:
+                lobes = light.window_lobes.copy()
+                lobes[:, :3] *= np.float32(radiance_scale)
+                emitter = {"type": "ile_window"}
+                for index, name in enumerate(("sun", "sky", "ground")):
+                    emitter[f"{name}_rgb"] = lobes[index, :3].tolist()
+                    emitter[f"{name}_direction"] = lobes[index, 3:6].tolist()
+                    emitter[f"{name}_concentration"] = float(lobes[index, 6])
+            else:
+                emitter = {
+                    "type": "area",
+                    "radiance": {"type": "rgb", "value": rgb.tolist()},
+                }
+            shape = {
                 "type": suffix[1:],
                 "filename": str(light.geometry_path),
                 "to_world": _light_transform(mi, light, visible_offset),
-                "emitter": {
-                    "type": "area",
-                    "radiance": {"type": "rgb", "value": rgb.tolist()},
-                },
+                "emitter": emitter,
             }
+            if light.is_window:
+                # Treat the reconstructed window mesh as a transparent light
+                # aperture. The emitter remains attached to the finite shape,
+                # while camera and indirect rays can continue to the scene
+                # geometry behind it instead of hitting Mitsuba's default
+                # zero-reflectance opaque BSDF.
+                shape["bsdf"] = {"type": "null"}
+            scene[f"ile_{light.name}"] = shape
 
     if mode in {"env", "combined"}:
         scene["far_field_env"] = {

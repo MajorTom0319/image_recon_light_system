@@ -87,6 +87,32 @@ python scripts/infer_envmap.py --image_path examples/infer_envmap/example_img.ex
 python scripts/edit_trans_ablation.py --ior 1.1
 ```
 
+### 3.2.1 IndoorLightEditing hybrid optimization
+
+The fixed-light hybrid entry combines Materialist geometry/materials with all
+four IndoorLightEditing local-light classes: visible/invisible lamps and
+visible/invisible windows. Lamps are Mitsuba mesh area emitters. Windows retain
+their predicted finite OBJ aperture and directional sun/sky/ground spherical-
+Gaussian lobes, instead of being reduced to a uniform RGB rectangle.
+
+```bash
+/home/majortom/miniconda3/envs/materialist5090/bin/python \
+  scripts/optimize_ile_farfield_materials.py \
+  --materialist-dir output_imgs/indoorlightediting_test1 \
+  --lights-json /path/to/light_predictions.json \
+  --farfield-iters 300 \
+  --material-iters 500 \
+  --material-order rm a \
+  --model_name none
+```
+
+This entry skips per-light Stage B refinement: all ILE lamps and window lobes
+remain fixed, Stage C optimizes the low-resolution far-field HDRI, and Stage D
+freezes all lighting while optimizing roughness/metallic followed by albedo.
+Use `--model_name pos_mlp` for the PosMLP parameterization. See
+[`hybrid_light/README.md`](hybrid_light/README.md) for the complete data model,
+rendering semantics, outputs, and validation notes.
+
 
 
 ### 3.3 Rendering and Editing

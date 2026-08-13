@@ -62,12 +62,14 @@ def load_ile_lights(
     *,
     include_visible: bool = True,
     include_invisible: bool = True,
+    include_windows: bool = False,
     geometry_scale: float | None = None,
 ) -> ILELightSet:
-    """Load lamp meshes and radiance from an ILE ``light_predictions.json``.
+    """Load ILE mesh lights and their radiance from ``light_predictions.json``.
 
-    Windows are intentionally excluded from this first prototype because ILE's
-    directional sun/sky/ground window representation is not a uniform emitter.
+    Window records retain ILE's directional sun/sky/ground spherical-Gaussian
+    parameters. They are opt-in because the Stage-B entry only supports one
+    uniform RGB scale per lamp; the fixed-light material entry enables them.
     """
     json_path = Path(json_path).expanduser().resolve()
     with json_path.open("r", encoding="utf-8") as stream:
@@ -84,6 +86,7 @@ def load_ile_lights(
 
     inputs = document.get("inputs") or {}
     lamp_masks = inputs.get("lamp_masks") or []
+    window_masks = inputs.get("window_masks") or []
     lights: list[MeshAreaLight] = []
 
     def append_record(record: dict[str, Any], *, visible: bool, default_id: int) -> None:
@@ -112,6 +115,43 @@ def load_ile_lights(
             )
         )
 
+    def append_window(record: dict[str, Any], *, visible: bool, default_id: int) -> None:
+        geometry_name = record.get("geometry_file")
+        if not geometry_name:
+            raise ValueError(f"Window {default_id} does not provide geometry_file")
+        light_id = int(record.get("id", default_id))
+        mask_path = None
+        if visible and 0 <= light_id < len(window_masks):
+            mask_path = _optional_path(window_masks[light_id], json_dir)
+        lobes = np.stack(
+            [
+                _vector(record.get("src"), 7, "src"),
+                _vector(record.get("srcSky"), 7, "srcSky"),
+                _vector(record.get("srcGrd"), 7, "srcGrd"),
+            ],
+            axis=0,
+        )
+        lights.append(
+            MeshAreaLight(
+                id=light_id,
+                light_type="visible_window" if visible else "invisible_window",
+                center=_vector(record.get("center"), 3, "center"),
+                # Keep the primary (sun) RGB available to generic diagnostics.
+                # Rendering uses all three directional lobes below.
+                rgb=lobes[0, :3],
+                geometry_path=_resolve_geometry(
+                    str(geometry_name),
+                    json_dir=json_dir,
+                    prediction_dir=prediction_dir,
+                ),
+                visible=visible,
+                geometry_scale=scale,
+                confidence=float(record.get("confidence", 1.0)),
+                mask_path=mask_path,
+                window_lobes=lobes,
+            )
+        )
+
     raw_lights = document["lights"]
     if include_visible:
         for index, record in enumerate(raw_lights.get("visible_lamps") or []):
@@ -123,8 +163,22 @@ def load_ile_lights(
             for index, record in enumerate(records):
                 append_record(record, visible=False, default_id=index)
 
+    windows_present = bool(
+        raw_lights.get("visible_windows") or raw_lights.get("invisible_window")
+    )
+    if include_windows:
+        if include_visible:
+            for index, record in enumerate(raw_lights.get("visible_windows") or []):
+                append_window(record, visible=True, default_id=index)
+        if include_invisible:
+            invisible = raw_lights.get("invisible_window")
+            if invisible:
+                records = invisible if isinstance(invisible, list) else [invisible]
+                for index, record in enumerate(records):
+                    append_window(record, visible=False, default_id=index)
+
     if not lights:
-        raise ValueError("No supported visible/invisible lamps were found")
+        raise ValueError("No supported ILE lamps or windows were found")
 
     return ILELightSet(
         source_path=json_path,
@@ -135,8 +189,7 @@ def load_ile_lights(
         metadata={
             "prediction_dir": str(prediction_dir) if prediction_dir else None,
             "geometry_scale": scale,
-            "windows_ignored": bool(
-                raw_lights.get("visible_windows") or raw_lights.get("invisible_window")
-            ),
+            "windows_ignored": windows_present and not include_windows,
+            "windows_included": sum(light.is_window for light in lights),
         },
     )

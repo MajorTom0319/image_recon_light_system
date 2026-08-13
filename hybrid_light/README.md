@@ -1,14 +1,16 @@
 # IndoorLightEditing → Materialist prototype
 
-This bridge loads the lamp meshes and RGB intensities exported in
+This bridge loads the light meshes and intensities exported in
 `light_predictions.json`, keeps their current camera-space convention
 (`+X` right, `+Y` up, `-Z` forward), and attaches the meshes to a Materialist
-scene as Mitsuba area emitters. Materialist's reconstructed PLY and per-pixel
+scene as Mitsuba emitters. Materialist's reconstructed PLY and per-pixel
 albedo/roughness/metallic/normal maps remain responsible for geometry and BRDF.
 
-The first version supports visible and invisible **lamps**. ILE windows are
-reported but deliberately ignored because their sun/sky/ground lobes cannot be
-faithfully represented by a uniform area emitter.
+The fixed-light material optimizer includes visible/invisible lamps and
+visible/invisible windows. Lamps use ordinary area emitters; each window keeps
+its finite OBJ aperture and the original ILE sun/sky/ground directional
+spherical-Gaussian lobes. Other hybrid entries remain lamp-only by default
+because their Stage-B parameterization assumes one uniform RGB value per lamp.
 
 Prepare a consistent Materialist scene and IndoorLightEditing depth first:
 
@@ -86,11 +88,11 @@ combined renders, `farfield_optimized_32x16.exr/.hdr`, and
 `optimization_manifest.json`. Use `--stage-b-only` to stop before the HDRI
 stage.
 
-## Fixed lamps: Stage C + material refinement
+## Fixed local lights: Stage C + material refinement
 
-For the experiment that disables Stage B, keeps the input ILE lamp radiance
-fixed, optimizes the 32x16 far-field HDRI first, and then optimizes Materialist
-ARM maps:
+For the experiment that disables Stage B, keeps all input ILE lamp and window
+radiance fixed, optimizes the 32x16 far-field HDRI first, and then optimizes
+Materialist ARM maps:
 
 ```bash
 /home/majortom/miniconda3/envs/materialist5090/bin/python \
@@ -110,6 +112,25 @@ Materialist's positional MLP for both Stage C and Stage D, change it to:
 ```bash
 --model_name pos_mlp
 ```
+
+This entry automatically calls `load_ile_lights(..., include_windows=True)`;
+no extra CLI switch is required. A window record keeps the three ILE lobes
+`src`, `srcSky`, and `srcGrd`, each encoded as
+`[RGB, direction_x, direction_y, direction_z, concentration]`. For a direction
+`w` from the shaded point toward the sampled window aperture, the emitted
+radiance is
+
+```text
+L(w) = sum_k RGB_k * exp(lambda_k * min(dot(direction_k, w) - 1, 0))
+       k in {sun, sky, ground}
+```
+
+The OBJ still determines the finite aperture, distance, visibility, and soft
+shadow. The directional formula is evaluated inside the custom
+`ile_window` Mitsuba emitter; reducing the three lobes to a uniform summed RGB
+would discard the predicted directions and concentrations. `--radiance-scale`
+multiplies all lamp RGB values and all three window RGB values, while leaving
+window directions and concentrations unchanged.
 
 The PosMLP branch parameterizes the HDRI with spherical coordinates and the
 ARM maps with image-space UV coordinates. It keeps the same loss terms,
@@ -149,11 +170,24 @@ combined rendering produced by this same best HDRI checkpoint. The auto-exposed
 `farfield_optimized_32x16_preview.png` is only for inspecting low-radiance HDRI
 structure and is never used for rendering.
 
-The material candidate still uses a same-seed high-SPP validation gate. Inspect
+Stage C and the material candidate both use same-seed high-SPP validation
+gates. If the Stage-C candidate has a worse display MSE than the initial HDRI,
+the initial HDRI is restored before export and Stage D; the rejected candidate
+remains available as `farfield_candidate_combined.*`. Inspect
 `material_phase_summaries.json` for the actual order, per-phase best MSE, and
 frozen-channel error; a nonzero error above tolerance aborts the run. Also
 inspect `farfield_metrics.json`, `final_metrics.json`, and the corresponding
-`*_target_render_error.png` comparisons. The latest default output directory is
-`hybrid_ile_farfield_material_opt_v6/`; older directories contain previous
-material-order, target, or HDRI-selection semantics and should not be mixed
-with v6.
+`*_target_render_error.png` comparisons. `optimization_manifest.json` records
+`fixed_local_lights`, `fixed_window_count`, and `fixed_local_radiance_scale`, so
+a run can be checked for all expected local lights. The current default output
+directory is `hybrid_ile_windows_farfield_material_opt_none_posmlp/`; pass an explicit
+`--output-dir` when comparing `none` and `pos_mlp` to avoid overwriting results.
+
+The Example1 export resolves to four fixed local lights: one visible lamp, one
+invisible lamp, one visible window, and one invisible window. Targeted LLVM AD
+and `cuda_ad_rgb` smoke tests produced finite non-black renders and finite,
+nonzero material gradients. The Python emitter is JIT-compiled by Dr.Jit; the
+first CUDA use can take several minutes, while later runs can reuse the cache.
+The current emitter uniformly samples the finite window aperture rather than
+importance sampling a sharp sun SG, so high-concentration windows may need a
+higher SPP.
