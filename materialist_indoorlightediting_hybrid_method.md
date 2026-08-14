@@ -6,7 +6,7 @@
 >
 > 第一阶段目标不是直接完成最终论文，而是先做出一个可运行、可调试、可定量分析的 prototype，为后续的 Hybrid Near-field + Far-field Lighting Reconstruction 打基础。
 
-> **当前实现状态（2026-08-12）**：本文档前半部分保留了最初“先完成 lamp、暂缓 window”的研究路线，作为设计演进记录；它不再代表当前代码边界。`scripts/optimize_ile_farfield_materials.py` 已经接入 visible/invisible lamp 和 visible/invisible window。Lamp 使用普通 Mitsuba mesh area emitter；window 使用有限 OBJ 孔径，并通过 `hybrid_light/ile_window_emitter.py` 保留 ILE `src/srcSky/srcGrd` 三组 `[RGB, direction, concentration]` 球面高斯。Stage B 逐灯 scale 和通用 renderer 仍默认 lamp-only。
+> **当前实现状态（2026-08-14）**：本文档前半部分保留了最初“先完成 lamp、暂缓 window”的研究路线，作为设计演进记录；它不再代表当前代码边界。`scripts/optimize_ile_farfield_materials.py` 已经接入 visible/invisible lamp 和 visible/invisible window。Lamp 使用普通 Mitsuba mesh area emitter；window 使用有限 OBJ 孔径、显式 `null` BSDF，并通过 `hybrid_light/ile_window_emitter.py` 保留 ILE `src/srcSky/srcGrd` 三组 `[RGB, direction, concentration]` 球面高斯。Window 保持预测位置，不应用 visible offset；offset 只用于 visible lamp。固定灯光优化默认使用 MoGe2 normal、PRB `max_depth=4`、灯具/深度/mesh-edge masked clipped-sRGB loss、周期固定多 seed validation，以及独立的 256 SPP raw final render。Direct Adam 启用 AMSGrad/masked updates，PosMLP 显式关闭 weight decay。Stage B 逐灯 scale 和通用 renderer 仍默认 lamp-only。
 
 ---
 
@@ -2849,12 +2849,15 @@ ground lobe
 
 ```text
 finite window OBJ
++ explicit null BSDF
 + sun SG
 + sky SG
 + ground SG
 ```
 
-该 emitter 已通过 LLVM AD 与 CUDA AD 的有限值、非零梯度 smoke test。后续不再是“是否接入 window”，而是研究高 concentration sun lobe 的 importance sampling、window-only 消融，以及是否为三组 SG 增加受约束的 radiance refinement。
+这里必须使用显式 `null` BSDF：删除 `bsdf` 字段会让 Mitsuba 补上默认不透明材质，导致相机看到黑色孔洞。Window 也不能复用 visible lamp 的朝相机 offset，否则会改变物理孔径并破坏与墙面的对齐；实际 scene 和投影诊断均只移动 visible lamp。
+
+该 emitter 已通过 LLVM AD 与 CUDA AD 的有限值、非零梯度 smoke test；新的 direct/PosMLP 固定灯光优化还在 Example1 上通过了 PRB `max_depth=4` 端到端 smoke test。后续不再是“是否接入 window”，而是研究高 concentration sun lobe 的 importance sampling、window-only 消融，以及是否为三组 SG 增加受约束的 radiance refinement。
 
 ---
 

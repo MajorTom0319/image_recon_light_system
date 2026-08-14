@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -34,7 +34,6 @@ from scripts.optimize_ile_farfield import (
     linear_to_srgb_np,
     load_target_linear,
     optimize_farfield,
-    render_and_save,
     save_linear_image,
     set_material_parameters,
     write_json,
@@ -165,13 +164,50 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(resample_each_iteration=True)
 
+    parser.add_argument(
+        "--use-mesh-normal",
+        action="store_true",
+        help="Use interpolated PLY normals instead of the loaded MoGe2 normal map",
+    )
+    parser.add_argument(
+        "--integrator",
+        choices=("prb", "path"),
+        default="prb",
+        help="Differentiable integrator used for optimization and validation",
+    )
+    parser.add_argument("--validation-interval", type=int, default=25)
+    parser.add_argument("--validation-seeds", type=int, default=2)
+    parser.add_argument(
+        "--validation-min-delta",
+        type=float,
+        default=1e-3,
+        help="Required relative validation-MSE improvement",
+    )
+    parser.add_argument(
+        "--validation-patience",
+        type=int,
+        default=8,
+        help="Validation checks without improvement before early stopping",
+    )
+    parser.add_argument("--emitter-mask-dilate", type=int, default=3)
+    parser.add_argument("--mesh-edge-dilate", type=int, default=2)
+    parser.add_argument("--depth-edge-rtol", type=float, default=0.05)
+
     parser.add_argument("--charbonnier-weight", type=float, default=1.0)
     parser.add_argument("--mse-weight", type=float, default=0.1)
     parser.add_argument("--charbonnier-epsilon", type=float, default=1e-3)
     parser.add_argument("--spp", type=int, default=16)
     parser.add_argument("--spp-grad", type=int, default=16)
-    parser.add_argument("--preview-spp", type=int, default=128)
-    parser.add_argument("--max-depth", type=int, default=8)
+    parser.add_argument(
+        "--validation-spp",
+        "--preview-spp",
+        dest="validation_spp",
+        type=int,
+        default=64,
+        help="SPP per fixed validation seed; --preview-spp is a compatibility alias",
+    )
+    parser.add_argument("--final-spp", type=int, default=256)
+    parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--no-denoise", action="store_true")
@@ -197,7 +233,11 @@ def parse_args() -> argparse.Namespace:
         "material_patience",
         "spp",
         "spp_grad",
-        "preview_spp",
+        "validation_spp",
+        "validation_seeds",
+        "validation_interval",
+        "validation_patience",
+        "final_spp",
         "max_depth",
         "log_interval",
     )
@@ -212,6 +252,10 @@ def parse_args() -> argparse.Namespace:
         "charbonnier_weight",
         "mse_weight",
         "visible_offset",
+        "validation_min_delta",
+        "emitter_mask_dilate",
+        "mesh_edge_dilate",
+        "depth_edge_rtol",
     )
     for name in nonnegative:
         if getattr(args, name) < 0:
@@ -239,6 +283,271 @@ def material_learning_rate(iteration: int, args) -> float:
 
 def mean_abs_dr(dr, value):
     return dr.mean(dr.abs(value.array))
+
+
+def _masked_mean_dr(dr, value, loss_mask):
+    if loss_mask is None:
+        return dr.mean(value)
+    denominator = dr.maximum(dr.sum(loss_mask.array), 1e-8)
+    return dr.sum(value * loss_mask.array) / denominator
+
+
+def linear_to_display_srgb_np(value: np.ndarray) -> np.ndarray:
+    """Convert LDR-referred linear RGB to the clipped display domain."""
+    return linear_to_srgb_np(np.clip(np.asarray(value, dtype=np.float32), 0.0, 1.0))
+
+
+def linear_to_display_srgb_dr(dr, value):
+    return linear_to_srgb_dr(dr, dr.clip(value, 0.0, 1.0))
+
+
+def _masked_mean_np(value: np.ndarray, mask: np.ndarray | None) -> float:
+    value = np.asarray(value, dtype=np.float64)
+    if mask is None:
+        return float(np.mean(value))
+    weights = np.asarray(mask, dtype=np.float64)
+    if weights.ndim == value.ndim - 1:
+        weights = weights[..., None]
+    weights = np.broadcast_to(weights, value.shape)
+    denominator = float(np.sum(weights))
+    if denominator <= 0:
+        raise ValueError("Loss mask contains no valid pixels")
+    return float(np.sum(value * weights) / denominator)
+
+
+def _load_binary_mask(path: Path, target_hw: tuple[int, int]) -> np.ndarray:
+    value = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if value is None:
+        raise FileNotFoundError(path)
+    height, width = target_hw
+    if value.shape != (height, width):
+        value = cv2.resize(value, (width, height), interpolation=cv2.INTER_NEAREST)
+    return value > 127
+
+
+def _depth_discontinuity_mask(
+    depth: np.ndarray,
+    valid: np.ndarray,
+    relative_threshold: float,
+) -> np.ndarray:
+    """Mark both sides of large horizontal/vertical depth jumps."""
+    depth = np.asarray(depth, dtype=np.float32)
+    edge = np.zeros(depth.shape, dtype=bool)
+    horizontal_boundary = valid[:, 1:] != valid[:, :-1]
+    edge[:, 1:] |= horizontal_boundary
+    edge[:, :-1] |= horizontal_boundary
+    horizontal_valid = valid[:, 1:] & valid[:, :-1]
+    horizontal_scale = np.maximum(
+        np.minimum(np.abs(depth[:, 1:]), np.abs(depth[:, :-1])), 1e-6
+    )
+    horizontal = horizontal_valid & (
+        np.abs(depth[:, 1:] - depth[:, :-1]) / horizontal_scale
+        > relative_threshold
+    )
+    edge[:, 1:] |= horizontal
+    edge[:, :-1] |= horizontal
+
+    vertical_boundary = valid[1:, :] != valid[:-1, :]
+    edge[1:, :] |= vertical_boundary
+    edge[:-1, :] |= vertical_boundary
+    vertical_valid = valid[1:, :] & valid[:-1, :]
+    vertical_scale = np.maximum(
+        np.minimum(np.abs(depth[1:, :]), np.abs(depth[:-1, :])), 1e-6
+    )
+    vertical = vertical_valid & (
+        np.abs(depth[1:, :] - depth[:-1, :]) / vertical_scale
+        > relative_threshold
+    )
+    edge[1:, :] |= vertical
+    edge[:-1, :] |= vertical
+    return edge
+
+
+def build_loss_masks(
+    mi,
+    *,
+    materialist_dir: Path,
+    light_set,
+    target_hw: tuple[int, int],
+    emitter_dilate: int,
+    edge_dilate: int,
+    depth_edge_rtol: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Build separate far-field and material masks from existing assets."""
+    height, width = target_hw
+    emitter_mask = np.zeros((height, width), dtype=bool)
+    emitter_paths: list[str] = []
+    for light in light_set.lights:
+        if not light.visible or light.mask_path is None or not light.mask_path.is_file():
+            continue
+        emitter_mask |= _load_binary_mask(light.mask_path, target_hw)
+        emitter_paths.append(str(light.mask_path))
+    if emitter_dilate > 0 and emitter_mask.any():
+        kernel_size = 2 * emitter_dilate + 1
+        emitter_mask = cv2.dilate(
+            emitter_mask.astype(np.uint8),
+            np.ones((kernel_size, kernel_size), dtype=np.uint8),
+        ).astype(bool)
+
+    valid_mask = np.ones((height, width), dtype=bool)
+    valid_path = None
+    for candidate in ("mesh_valid_mask.png", "moge2_valid_mask.png"):
+        path = materialist_dir / candidate
+        if path.is_file():
+            valid_mask = _load_binary_mask(path, target_hw)
+            valid_path = str(path)
+            break
+
+    depth_edge = np.zeros((height, width), dtype=bool)
+    depth_path = None
+    for candidate in ("moge2_depth.exr", "mesh_depth.exr", "depthPred.exr"):
+        path = materialist_dir / candidate
+        if not path.is_file():
+            continue
+        depth = np.asarray(mi.Bitmap(str(path)), dtype=np.float32)
+        depth = np.squeeze(depth)
+        if depth.shape != (height, width):
+            depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST)
+        depth_valid = np.isfinite(depth) & (depth > 0.0) & valid_mask
+        valid_mask &= depth_valid
+        depth_edge = _depth_discontinuity_mask(
+            depth,
+            depth_valid,
+            depth_edge_rtol,
+        )
+        depth_path = str(path)
+        break
+
+    if edge_dilate > 0:
+        kernel_size = 2 * edge_dilate + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if depth_edge.any():
+            depth_edge = cv2.dilate(depth_edge.astype(np.uint8), kernel).astype(bool)
+        valid_mask = cv2.erode(valid_mask.astype(np.uint8), kernel).astype(bool)
+
+    farfield_mask = ~(emitter_mask | depth_edge)
+    material_mask = valid_mask & farfield_mask
+    if not farfield_mask.any() or not material_mask.any():
+        raise ValueError("Generated loss mask contains no valid pixels")
+    metadata = {
+        "emitter_masks": emitter_paths,
+        "valid_mask": valid_path,
+        "depth": depth_path,
+        "emitter_excluded_fraction": float(emitter_mask.mean()),
+        "depth_edge_excluded_fraction": float(depth_edge.mean()),
+        "farfield_valid_fraction": float(farfield_mask.mean()),
+        "material_valid_fraction": float(material_mask.mean()),
+    }
+    return (
+        np.repeat(farfield_mask[..., None], 3, axis=-1).astype(np.float32),
+        np.repeat(material_mask[..., None], 3, axis=-1).astype(np.float32),
+        metadata,
+    )
+
+
+def _display_mse_np(
+    target_linear: np.ndarray,
+    rendered_linear: np.ndarray,
+    loss_mask: np.ndarray | None,
+) -> float:
+    difference = (
+        linear_to_display_srgb_np(rendered_linear)
+        - linear_to_display_srgb_np(target_linear)
+    )
+    return _masked_mean_np(np.square(difference), loss_mask)
+
+
+def render_validation_mean(
+    mi,
+    dr,
+    scene,
+    params,
+    *,
+    spp: int,
+    seeds: list[int],
+) -> np.ndarray:
+    renders = []
+    with dr.suspend_grad():
+        for seed in seeds:
+            rendered = mi.render(scene, params, spp=spp, seed=seed)
+            dr.eval(rendered)
+            renders.append(np.asarray(rendered, dtype=np.float32))
+    return np.mean(np.stack(renders, axis=0), axis=0, dtype=np.float32)
+
+
+def save_render_variants(
+    mi,
+    *,
+    base_path: Path,
+    rendered_raw: np.ndarray,
+    denoise: bool,
+) -> tuple[np.ndarray, dict[str, str]]:
+    raw_base = base_path.with_name(base_path.name + "_raw")
+    save_linear_image(mi, raw_base, rendered_raw)
+    displayed = rendered_raw
+    outputs = {
+        "raw_exr": str(raw_base.with_suffix(".exr")),
+        "raw_png": str(raw_base.with_suffix(".png")),
+    }
+    if denoise:
+        denoiser = mi.OptixDenoiser(
+            input_size=(int(rendered_raw.shape[1]), int(rendered_raw.shape[0])),
+            albedo=False,
+            normals=False,
+            temporal=False,
+        )
+        displayed = np.asarray(
+            denoiser(mi.TensorXf(np.asarray(rendered_raw, dtype=np.float32))),
+            dtype=np.float32,
+        )
+        outputs.update(
+            {
+                "denoised_exr": str(base_path.with_suffix(".exr")),
+                "denoised_png": str(base_path.with_suffix(".png")),
+            }
+        )
+    save_linear_image(mi, base_path, displayed)
+    return displayed, outputs
+
+
+def save_final_render_variants(
+    mi,
+    *,
+    best_dir: Path,
+    rendered_raw: np.ndarray,
+    denoise: bool,
+) -> dict[str, str]:
+    """Keep the authoritative final result raw; denoise only a named preview."""
+    compatibility_base = best_dir / "rendered_img"
+    raw_base = best_dir / "rendered_img_final_raw"
+    save_linear_image(mi, compatibility_base, rendered_raw)
+    save_linear_image(mi, raw_base, rendered_raw)
+    outputs = {
+        "rendered_img_exr": str(compatibility_base.with_suffix(".exr")),
+        "rendered_img_png": str(compatibility_base.with_suffix(".png")),
+        "final_raw_exr": str(raw_base.with_suffix(".exr")),
+        "final_raw_png": str(raw_base.with_suffix(".png")),
+    }
+    if denoise:
+        denoiser = mi.OptixDenoiser(
+            input_size=(int(rendered_raw.shape[1]), int(rendered_raw.shape[0])),
+            albedo=False,
+            normals=False,
+            temporal=False,
+        )
+        denoised = np.asarray(
+            denoiser(mi.TensorXf(np.asarray(rendered_raw, dtype=np.float32))),
+            dtype=np.float32,
+        )
+        denoised_base = best_dir / "rendered_img_final_denoised"
+        save_linear_image(mi, denoised_base, denoised)
+        outputs.update(
+            {
+                "final_denoised_exr": str(denoised_base.with_suffix(".exr")),
+                "final_denoised_png": str(denoised_base.with_suffix(".png")),
+            }
+        )
+    return outputs
 
 
 def resolve_target_path(args, light_set, materialist_dir: Path) -> tuple[Path, str]:
@@ -279,17 +588,26 @@ def resolve_target_path(args, light_set, materialist_dir: Path) -> tuple[Path, s
     return path, source
 
 
-def image_metrics(target_linear: np.ndarray, rendered_linear: np.ndarray) -> dict[str, float]:
+def image_metrics(
+    target_linear: np.ndarray,
+    rendered_linear: np.ndarray,
+    loss_mask: np.ndarray | None = None,
+) -> dict[str, float]:
     """Metrics matching the display-space optimization objective."""
-    target = linear_to_srgb_np(target_linear)
-    rendered = linear_to_srgb_np(rendered_linear)
+    target = linear_to_display_srgb_np(target_linear)
+    rendered = linear_to_display_srgb_np(rendered_linear)
     difference = rendered - target
-    mse = float(np.mean(np.square(difference)))
+    mse = _masked_mean_np(np.square(difference), loss_mask)
     return {
-        "display_mae": float(np.mean(np.abs(difference))),
+        "display_mae": _masked_mean_np(np.abs(difference), loss_mask),
         "display_mse": mse,
         "display_psnr": float("inf") if mse == 0 else float(-10.0 * np.log10(mse)),
-        "linear_mae": float(np.mean(np.abs(rendered_linear - target_linear))),
+        "linear_mae": _masked_mean_np(
+            np.abs(rendered_linear - target_linear), loss_mask
+        ),
+        "evaluated_fraction": (
+            1.0 if loss_mask is None else float(np.asarray(loss_mask)[..., 0].mean())
+        ),
         "target_linear_mean": float(np.mean(target_linear)),
         "render_linear_mean": float(np.mean(rendered_linear)),
         "target_display_mean": float(np.mean(target)),
@@ -327,8 +645,8 @@ def save_comparison(
     target_linear: np.ndarray,
     rendered_linear: np.ndarray,
 ) -> None:
-    target = np.clip(linear_to_srgb_np(target_linear), 0.0, 1.0)
-    rendered = np.clip(linear_to_srgb_np(rendered_linear), 0.0, 1.0)
+    target = linear_to_display_srgb_np(target_linear)
+    rendered = linear_to_display_srgb_np(rendered_linear)
     error = np.clip(np.abs(rendered - target) * 4.0, 0.0, 1.0)
     canvas = np.concatenate([target, rendered, error], axis=1)
     canvas_u8 = (canvas * 255.0 + 0.5).astype(np.uint8)
@@ -355,6 +673,8 @@ def optimize_materials(
     target_linear,
     target_srgb,
     args,
+    loss_mask=None,
+    validation_fn: Callable[[], float] | None = None,
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
     """Sequential direct material optimization following optimize_order.
 
@@ -389,7 +709,11 @@ def optimize_materials(
             MATERIAL_KEYS[channel]: mi.TensorXf(initial_materials[channel])
             for channel in channels
         }
-        optimizer = mi.ad.Adam(lr=args.material_lr)
+        optimizer = mi.ad.Adam(
+            lr=args.material_lr,
+            amsgrad=True,
+            mask_updates=True,
+        )
         for key in keys:
             optimizer[key] = params[key]
         params.update(optimizer)
@@ -404,6 +728,14 @@ def optimize_materials(
             else (0.005 if "a" in channels else 0.001)
         )
         phase_start = len(history)
+
+        if validation_fn is not None:
+            best_mse = validation_fn()
+            early_stop_reference = best_mse
+            best_phase_materials = {
+                key: np.asarray(params[key], dtype=np.float32).copy()
+                for key in keys
+            }
 
         print(
             f"[Material phase {phase_index + 1}/{len(order)}] "
@@ -432,10 +764,10 @@ def optimize_materials(
                 )
                 exposure_ratio = target_mean / rendered_mean
             rendered_matched = rendered_linear * exposure_ratio
-            rendered_srgb = linear_to_srgb_dr(dr, rendered_matched)
+            rendered_srgb = linear_to_display_srgb_dr(dr, rendered_matched)
             difference = rendered_srgb.array - target_srgb.array
-            loss_mse = dr.mean(dr.square(difference))
-            loss_l1 = dr.mean(dr.abs(difference))
+            loss_mse = _masked_mean_dr(dr, dr.square(difference), loss_mask)
+            loss_l1 = _masked_mean_dr(dr, dr.abs(difference), loss_mask)
 
             # Same adaptive render loss as inverse_img_w_mi_ori.py.
             loss_balance = dr.detach(loss_l1) / dr.maximum(
@@ -475,21 +807,22 @@ def optimize_materials(
                 }
             )
 
-            if mse_value < best_mse:
+            if validation_fn is None and mse_value < best_mse:
                 best_mse = mse_value
                 best_phase_materials = {
                     key: np.asarray(optimizer[key], dtype=np.float32).copy()
                     for key in keys
                 }
 
-            if (
-                early_stop_reference is None
-                or mse_value < early_stop_reference * (1.0 - phase_min_delta)
-            ):
-                early_stop_reference = mse_value
-                stale_iterations = 0
-            else:
-                stale_iterations += 1
+            if validation_fn is None:
+                if (
+                    early_stop_reference is None
+                    or mse_value < early_stop_reference * (1.0 - phase_min_delta)
+                ):
+                    early_stop_reference = mse_value
+                    stale_iterations = 0
+                else:
+                    stale_iterations += 1
 
             dr.backward(loss)
             optimizer.step()
@@ -498,19 +831,54 @@ def optimize_materials(
                 optimizer[key] = dr.clip(optimizer[key], lower, upper)
             params.update(optimizer)
 
+            validation_mse = None
+            should_validate = (
+                validation_fn is not None
+                and (
+                    (iteration + 1) % args.validation_interval == 0
+                    or iteration == args.material_iters - 1
+                )
+            )
+            if should_validate:
+                validation_mse = validation_fn()
+                history[-1]["validation_mse"] = validation_mse
+                if validation_mse < best_mse:
+                    best_mse = validation_mse
+                    best_phase_materials = {
+                        key: np.asarray(optimizer[key], dtype=np.float32).copy()
+                        for key in keys
+                    }
+                if validation_mse < early_stop_reference * (
+                    1.0 - args.validation_min_delta
+                ):
+                    early_stop_reference = validation_mse
+                    stale_iterations = 0
+                else:
+                    stale_iterations += 1
+
             if iteration % args.log_interval == 0 or iteration == args.material_iters - 1:
                 print(
                     f"[Material {phase} {iteration:04d}/{args.material_iters}] "
                     f"loss={loss_value:.6f} render={float(loss_render[0]):.6f} "
                     f"mse={mse_value:.6f} l1={float(loss_l1[0]):.6f} "
                     f"prior={float(loss_prior[0]):.6f} "
-                    f"exposure={float(exposure_ratio[0]):.4f}"
+                    f"exposure={float(exposure_ratio[0]):.4f} "
+                    f"val={validation_mse if validation_mse is not None else '-'}"
                 )
-            if stale_iterations >= args.material_patience:
+            stopping_patience = (
+                args.validation_patience
+                if validation_fn is not None
+                else args.material_patience
+            )
+            if stale_iterations >= stopping_patience:
+                reason = (
+                    "validation did not improve"
+                    if validation_fn is not None
+                    else f"no relative MSE improvement >= {phase_min_delta:.4g}"
+                )
                 print(
                     f"[Material {phase}] early stopping at iteration {iteration}: "
-                    f"no relative MSE improvement >= {phase_min_delta:.4g} "
-                    f"for {args.material_patience} iterations"
+                    f"{reason}"
                 )
                 break
 
@@ -557,12 +925,18 @@ def optimize_materials(
 
 
 def _torch_linear_to_srgb(torch, value):
-    value = torch.clamp_min(value, 0.0)
+    value = torch.clamp(value, 0.0, 1.0)
     return torch.where(
         value <= 0.0031308,
         12.92 * value,
         1.055 * torch.pow(torch.clamp_min(value, 0.0031308), 1.0 / 2.4) - 0.055,
     )
+
+
+def _torch_masked_mean(torch, value, loss_mask):
+    if loss_mask is None:
+        return torch.mean(value)
+    return torch.sum(value * loss_mask) / torch.clamp_min(torch.sum(loss_mask), 1e-8)
 
 
 def optimize_farfield_pos_mlp(
@@ -573,10 +947,11 @@ def optimize_farfield_pos_mlp(
     params,
     target_srgb,
     args,
+    loss_mask=None,
+    validation_fn: Callable[[], float] | None = None,
 ) -> tuple[np.ndarray, list[dict[str, Any]], float]:
     """PosMLP parameterization of the existing Stage-C objective."""
     import torch
-    import torch.nn.functional as F
     from mymodels.mlps import PosMLP
 
     if not torch.cuda.is_available():
@@ -617,9 +992,20 @@ def optimize_farfield_pos_mlp(
     initial_bias = float(np.log(np.expm1(max(args.farfield_init, 1e-6))))
     with torch.no_grad():
         output_layer.bias.fill_(initial_bias)
-    optimizer = torch.optim.Adam(envmap_net.parameters(), lr=args.farfield_lr)
+    optimizer = torch.optim.Adam(
+        envmap_net.parameters(),
+        lr=args.farfield_lr,
+        weight_decay=0.0,
+    )
     target = torch.as_tensor(
         np.asarray(target_srgb, dtype=np.float32), device=device
+    )
+    loss_mask_torch = (
+        None
+        if loss_mask is None
+        else torch.as_tensor(
+            np.asarray(loss_mask, dtype=np.float32), device=device
+        )
     )
 
     @dr.wrap(source="torch", target="drjit")
@@ -638,6 +1024,12 @@ def optimize_farfield_pos_mlp(
     history: list[dict[str, Any]] = []
     best_loss = float("inf")
     best_env: np.ndarray | None = None
+    validation_reference: float | None = None
+    stale_validations = 0
+    if validation_fn is not None:
+        best_loss = validation_fn()
+        validation_reference = best_loss
+        best_env = np.asarray(params[env_key], dtype=np.float32).copy()
     for iteration in range(args.farfield_iters):
         learning_rate = cosine_learning_rate(
             iteration, args.farfield_iters, args.farfield_lr
@@ -659,10 +1051,15 @@ def optimize_farfield_pos_mlp(
             torch, render_envmap(storage_env, seed)
         )
         difference = rendered_srgb - target
-        loss_charbonnier = torch.mean(
+        loss_charbonnier = _torch_masked_mean(
+            torch,
             torch.sqrt(difference.square() + args.charbonnier_epsilon**2)
-        ) - args.charbonnier_epsilon
-        loss_mse = F.mse_loss(rendered_srgb, target)
+            - args.charbonnier_epsilon,
+            loss_mask_torch,
+        )
+        loss_mse = _torch_masked_mean(
+            torch, difference.square(), loss_mask_torch
+        )
         right = torch.roll(logical_env, shifts=-1, dims=1)
         down = torch.cat([logical_env[1:], logical_env[-1:]], dim=0)
         loss_tv = torch.mean(torch.abs(logical_env - right)) + torch.mean(
@@ -693,20 +1090,70 @@ def optimize_farfield_pos_mlp(
             if args.farfield_checkpoint_metric == "mse"
             else loss_value
         )
-        if checkpoint_value < best_loss:
+        if validation_fn is None and checkpoint_value < best_loss:
             best_loss = checkpoint_value
             best_env = storage_env.detach().cpu().numpy().copy()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        validation_mse = None
+        should_validate = (
+            validation_fn is not None
+            and (
+                (iteration + 1) % args.validation_interval == 0
+                or iteration == args.farfield_iters - 1
+            )
+        )
+        if should_validate:
+            with torch.no_grad():
+                validation_logical = envmap_net(start_envmap).reshape(
+                    args.farfield_height, args.farfield_width, 3
+                )
+                validation_logical = torch.clamp(
+                    validation_logical, 0.0, args.farfield_max
+                )
+                validation_storage = (
+                    torch.cat(
+                        [validation_logical, validation_logical[:, :1]], dim=1
+                    )
+                    if storage_shape[1] == args.farfield_width + 1
+                    else validation_logical
+                )
+            validation_storage_np = (
+                validation_storage.detach().cpu().numpy().copy()
+            )
+            params[env_key] = mi.TensorXf(validation_storage_np)
+            params.update()
+            validation_mse = validation_fn()
+            history[-1]["validation_mse"] = validation_mse
+            if validation_mse < best_loss:
+                best_loss = validation_mse
+                best_env = validation_storage_np
+            if validation_mse < validation_reference * (
+                1.0 - args.validation_min_delta
+            ):
+                validation_reference = validation_mse
+                stale_validations = 0
+            else:
+                stale_validations += 1
         if iteration % args.log_interval == 0 or iteration == args.farfield_iters - 1:
             print(
                 f"[Far-field PosMLP {iteration:04d}/{args.farfield_iters}] "
                 f"loss={loss_value:.6f} charb={float(loss_charbonnier.detach()):.6f} "
                 f"mse={mse_value:.6f} tv={float(loss_tv.detach()):.6f} "
-                f"energy={float(loss_energy.detach()):.6f}"
+                f"energy={float(loss_energy.detach()):.6f} "
+                f"val={validation_mse if validation_mse is not None else '-'}"
             )
+        if (
+            validation_fn is not None
+            and stale_validations >= args.validation_patience
+        ):
+            print(
+                f"[Far-field PosMLP] early stopping at {iteration}: "
+                "validation did not improve"
+            )
+            break
 
     if best_env is None:
         raise RuntimeError("PosMLP far-field optimization produced no checkpoint")
@@ -725,10 +1172,11 @@ def optimize_materials_pos_mlp(
     target_linear,
     target_srgb,
     args,
+    loss_mask=None,
+    validation_fn: Callable[[], float] | None = None,
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
     """PosMLP parameterization of the existing sequential material phases."""
     import torch
-    import torch.nn.functional as F
     from mymodels.mlps import PosMLP
 
     if not torch.cuda.is_available():
@@ -736,6 +1184,13 @@ def optimize_materials_pos_mlp(
     device = torch.device("cuda")
     target = torch.as_tensor(
         np.asarray(target_srgb, dtype=np.float32), device=device
+    )
+    loss_mask_torch = (
+        None
+        if loss_mask is None
+        else torch.as_tensor(
+            np.asarray(loss_mask, dtype=np.float32), device=device
+        )
     )
     target_mean = float(np.asarray(target_linear, dtype=np.float32).mean())
 
@@ -791,7 +1246,11 @@ def optimize_materials_pos_mlp(
             img_w=current["a"].shape[1],
             coordinate_type="uv",
         ).to(device)
-        optimizer = torch.optim.AdamW(brdf_net.parameters(), lr=args.material_lr)
+        optimizer = torch.optim.AdamW(
+            brdf_net.parameters(),
+            lr=args.material_lr,
+            weight_decay=0.0,
+        )
         initial = {
             channel: torch.as_tensor(
                 initial_materials[channel], dtype=torch.float32, device=device
@@ -812,6 +1271,13 @@ def optimize_materials_pos_mlp(
             else (0.005 if "a" in channels else 0.001)
         )
         phase_start = len(history)
+        if validation_fn is not None:
+            best_mse = validation_fn()
+            early_stop_reference = best_mse
+            best_phase_materials = {
+                MATERIAL_KEYS[channel]: current[channel].copy()
+                for channel in channels
+            }
         print(
             f"[Material PosMLP phase {phase_index + 1}/{len(order)}] "
             f"optimize={phase} frozen={''.join(frozen_channels) or 'none'}"
@@ -846,8 +1312,12 @@ def optimize_materials_pos_mlp(
                 torch, rendered_linear * exposure_ratio
             )
             difference = rendered_srgb - target
-            loss_mse = torch.mean(difference.square())
-            loss_l1 = torch.mean(torch.abs(difference))
+            loss_mse = _torch_masked_mean(
+                torch, difference.square(), loss_mask_torch
+            )
+            loss_l1 = _torch_masked_mean(
+                torch, torch.abs(difference), loss_mask_torch
+            )
             loss_balance = loss_l1.detach() / torch.clamp_min(
                 loss_mse.detach(), 1e-8
             )
@@ -879,33 +1349,90 @@ def optimize_materials_pos_mlp(
                     },
                 }
             )
-            if mse_value < best_mse:
+            if validation_fn is None and mse_value < best_mse:
                 best_mse = mse_value
                 best_phase_materials = {
                     MATERIAL_KEYS[channel]: materials[channel].detach().cpu().numpy().copy()
                     for channel in channels
                 }
-            if (
-                early_stop_reference is None
-                or mse_value < early_stop_reference * (1.0 - phase_min_delta)
-            ):
-                early_stop_reference = mse_value
-                stale_iterations = 0
-            else:
-                stale_iterations += 1
+            if validation_fn is None:
+                if (
+                    early_stop_reference is None
+                    or mse_value < early_stop_reference * (1.0 - phase_min_delta)
+                ):
+                    early_stop_reference = mse_value
+                    stale_iterations = 0
+                else:
+                    stale_iterations += 1
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            validation_mse = None
+            should_validate = (
+                validation_fn is not None
+                and (
+                    (iteration + 1) % args.validation_interval == 0
+                    or iteration == args.material_iters - 1
+                )
+            )
+            if should_validate:
+                with torch.no_grad():
+                    validation_arm = brdf_net(base_arm_torch)
+                    validation_predicted = {
+                        "a": validation_arm[:, :3].reshape(current["a"].shape),
+                        "r": (
+                            validation_arm[:, 3:4] * 0.93 + 0.07
+                        ).reshape(current["r"].shape),
+                        "m": validation_arm[:, 4:5].reshape(current["m"].shape),
+                    }
+                    validation_materials = {
+                        channel: (
+                            validation_predicted[channel]
+                            if channel in channels
+                            else current_torch[channel]
+                        )
+                        for channel in "arm"
+                    }
+                validation_numpy = {
+                    channel: value.detach().cpu().numpy().copy()
+                    for channel, value in validation_materials.items()
+                }
+                for channel in "arm":
+                    params[MATERIAL_KEYS[channel]] = mi.TensorXf(
+                        validation_numpy[channel]
+                    )
+                params.update()
+                validation_mse = validation_fn()
+                history[-1]["validation_mse"] = validation_mse
+                if validation_mse < best_mse:
+                    best_mse = validation_mse
+                    best_phase_materials = {
+                        MATERIAL_KEYS[channel]: validation_numpy[channel]
+                        for channel in channels
+                    }
+                if validation_mse < early_stop_reference * (
+                    1.0 - args.validation_min_delta
+                ):
+                    early_stop_reference = validation_mse
+                    stale_iterations = 0
+                else:
+                    stale_iterations += 1
             if iteration % args.log_interval == 0 or iteration == args.material_iters - 1:
                 print(
                     f"[Material PosMLP {phase} {iteration:04d}/{args.material_iters}] "
                     f"loss={loss_value:.6f} render={float(loss_render.detach()):.6f} "
                     f"mse={mse_value:.6f} l1={float(loss_l1.detach()):.6f} "
                     f"prior={float(loss_prior.detach()):.6f} "
-                    f"exposure={float(exposure_ratio):.4f}"
+                    f"exposure={float(exposure_ratio):.4f} "
+                    f"val={validation_mse if validation_mse is not None else '-'}"
                 )
-            if stale_iterations >= args.material_patience:
+            stopping_patience = (
+                args.validation_patience
+                if validation_fn is not None
+                else args.material_patience
+            )
+            if stale_iterations >= stopping_patience:
                 print(f"[Material PosMLP {phase}] early stopping at {iteration}")
                 break
 
@@ -991,7 +1518,7 @@ def main() -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else materialist_dir / "hybrid_ile_windows_nullbsdf_farfield_material_opt_posmlp_1"
+        else materialist_dir / "hybrid_ile_windows_farfield_material_opt_none_posmlp_default_512_814"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1031,8 +1558,36 @@ def main() -> None:
     target_path, target_source = resolve_target_path(args, light_set, materialist_dir)
     target_linear_np = load_target_linear(mi, target_path, (height, width))
     target_linear = mi.TensorXf(target_linear_np)
-    target_srgb = mi.TensorXf(linear_to_srgb_np(target_linear_np))
+    target_srgb_np = linear_to_display_srgb_np(target_linear_np)
+    target_srgb = mi.TensorXf(target_srgb_np)
     save_linear_image(mi, output_dir / "target", target_linear_np)
+    farfield_loss_mask_np, material_loss_mask_np, loss_mask_metadata = (
+        build_loss_masks(
+            mi,
+            materialist_dir=materialist_dir,
+            light_set=light_set,
+            target_hw=(height, width),
+            emitter_dilate=args.emitter_mask_dilate,
+            edge_dilate=args.mesh_edge_dilate,
+            depth_edge_rtol=args.depth_edge_rtol,
+        )
+    )
+    farfield_loss_mask = mi.TensorXf(farfield_loss_mask_np)
+    material_loss_mask = mi.TensorXf(material_loss_mask_np)
+    for name, value in (
+        ("farfield_loss_mask.png", farfield_loss_mask_np[..., 0]),
+        ("material_loss_mask.png", material_loss_mask_np[..., 0]),
+    ):
+        cv2.imwrite(str(output_dir / name), (value * 255.0 + 0.5).astype(np.uint8))
+    loss_mask_metadata.update(
+        {
+            "farfield_mask": str(output_dir / "farfield_loss_mask.png"),
+            "material_mask": str(output_dir / "material_loss_mask.png"),
+        }
+    )
+    # The current target is display-referred LDR stored in linear EXR form.
+    # Keep the shared far-field optimizer backward compatible and opt in here.
+    args.clip_display = True
 
     # Stage C: fixed ILE lamps and fixed input materials; optimize only HDRI.
     farfield_initial = np.full(
@@ -1052,9 +1607,10 @@ def main() -> None:
         envmap_path=farfield_initial_path,
         radiance_scale=args.radiance_scale,
         visible_offset=args.visible_offset,
-        use_mesh_normal=True,
+        use_mesh_normal=args.use_mesh_normal,
         max_depth=args.max_depth,
     )
+    scene_dict["integrator"]["type"] = args.integrator
     scene = mi.load_dict(scene_dict)
     params = mi.traverse(scene)
     set_material_parameters(mi, params, material_arrays)
@@ -1063,15 +1619,40 @@ def main() -> None:
         raise KeyError(f"Combined scene is missing {env_key}")
     farfield_initial_storage = np.asarray(params[env_key], dtype=np.float32).copy()
     farfield_validation_seed = args.seed + 100000
-    farfield_initial_render = render_and_save(
+    farfield_validation_seeds = [
+        farfield_validation_seed + index * 2
+        for index in range(args.validation_seeds)
+    ]
+    farfield_initial_render = render_validation_mean(
         mi,
+        dr,
         scene,
         params,
-        output_dir / "farfield_initial_combined",
-        spp=args.preview_spp,
-        seed=farfield_validation_seed,
+        spp=args.validation_spp,
+        seeds=farfield_validation_seeds,
+    )
+    save_render_variants(
+        mi,
+        base_path=output_dir / "farfield_initial_combined",
+        rendered_raw=farfield_initial_render,
         denoise=not args.no_denoise,
     )
+
+    def validate_farfield_checkpoint() -> float:
+        rendered = render_validation_mean(
+            mi,
+            dr,
+            scene,
+            params,
+            spp=args.validation_spp,
+            seeds=farfield_validation_seeds,
+        )
+        return _display_mse_np(
+            target_linear_np,
+            rendered,
+            farfield_loss_mask_np,
+        )
+
     farfield_optimizer = (
         optimize_farfield_pos_mlp
         if args.model_name == "pos_mlp"
@@ -1084,18 +1665,29 @@ def main() -> None:
         params=params,
         target_srgb=target_srgb,
         args=args,
+        loss_mask=farfield_loss_mask,
+        validation_fn=validate_farfield_checkpoint,
     )
-    farfield_render = render_and_save(
+    farfield_render = render_validation_mean(
         mi,
+        dr,
         scene,
         params,
-        output_dir / "farfield_candidate_combined",
-        spp=args.preview_spp,
-        seed=farfield_validation_seed,
+        spp=args.validation_spp,
+        seeds=farfield_validation_seeds,
+    )
+    save_render_variants(
+        mi,
+        base_path=output_dir / "farfield_candidate_combined",
+        rendered_raw=farfield_render,
         denoise=not args.no_denoise,
     )
-    farfield_initial_metrics = image_metrics(target_linear_np, farfield_initial_render)
-    farfield_candidate_metrics = image_metrics(target_linear_np, farfield_render)
+    farfield_initial_metrics = image_metrics(
+        target_linear_np, farfield_initial_render, farfield_loss_mask_np
+    )
+    farfield_candidate_metrics = image_metrics(
+        target_linear_np, farfield_render, farfield_loss_mask_np
+    )
     (
         selected_farfield,
         selected_farfield_render,
@@ -1143,8 +1735,9 @@ def main() -> None:
     write_json(
         output_dir / "farfield_metrics.json",
         {
-            "validation_spp": args.preview_spp,
+            "validation_spp": args.validation_spp,
             "validation_seed": farfield_validation_seed,
+            "validation_seeds": farfield_validation_seeds,
             "initial": farfield_initial_metrics,
             "candidate": farfield_candidate_metrics,
             "selected": farfield_metrics,
@@ -1180,9 +1773,10 @@ def main() -> None:
         envmap_path=farfield_exr,
         radiance_scale=args.radiance_scale,
         visible_offset=args.visible_offset,
-        use_mesh_normal=True,
+        use_mesh_normal=args.use_mesh_normal,
         max_depth=args.max_depth,
     )
+    material_scene_dict["integrator"]["type"] = args.integrator
     scene = mi.load_dict(material_scene_dict)
     params = mi.traverse(scene)
     set_material_parameters(mi, params, material_arrays)
@@ -1201,15 +1795,40 @@ def main() -> None:
 
     # Stage D: optimizer contains ARM tensors only. Lights and HDRI stay fixed.
     material_validation_seed = args.seed + 300000
-    material_initial_render = render_and_save(
+    material_validation_seeds = [
+        material_validation_seed + index * 2
+        for index in range(args.validation_seeds)
+    ]
+    material_initial_render = render_validation_mean(
         mi,
+        dr,
         scene,
         params,
-        output_dir / "material_initial_combined",
-        spp=args.preview_spp,
-        seed=material_validation_seed,
+        spp=args.validation_spp,
+        seeds=material_validation_seeds,
+    )
+    save_render_variants(
+        mi,
+        base_path=output_dir / "material_initial_combined",
+        rendered_raw=material_initial_render,
         denoise=not args.no_denoise,
     )
+
+    def validate_material_checkpoint() -> float:
+        rendered = render_validation_mean(
+            mi,
+            dr,
+            scene,
+            params,
+            spp=args.validation_spp,
+            seeds=material_validation_seeds,
+        )
+        return _display_mse_np(
+            target_linear_np,
+            rendered,
+            material_loss_mask_np,
+        )
+
     material_optimizer = (
         optimize_materials_pos_mlp
         if args.model_name == "pos_mlp"
@@ -1224,14 +1843,21 @@ def main() -> None:
         target_linear=target_linear,
         target_srgb=target_srgb,
         args=args,
+        loss_mask=material_loss_mask,
+        validation_fn=validate_material_checkpoint,
     )
-    final_render = render_and_save(
+    material_candidate_render = render_validation_mean(
         mi,
+        dr,
         scene,
         params,
-        output_dir / "material_optimized_combined",
-        spp=args.preview_spp,
-        seed=material_validation_seed,
+        spp=args.validation_spp,
+        seeds=material_validation_seeds,
+    )
+    save_render_variants(
+        mi,
+        base_path=output_dir / "material_optimized_combined",
+        rendered_raw=material_candidate_render,
         denoise=not args.no_denoise,
     )
     farfield_after_material = np.asarray(params[env_key], dtype=np.float32)
@@ -1245,8 +1871,12 @@ def main() -> None:
         )
     write_json(output_dir / "material_history.json", material_history)
     write_json(output_dir / "material_phase_summaries.json", material_phase_summaries)
-    material_initial_metrics = image_metrics(target_linear_np, material_initial_render)
-    material_candidate_metrics = image_metrics(target_linear_np, final_render)
+    material_initial_metrics = image_metrics(
+        target_linear_np, material_initial_render, material_loss_mask_np
+    )
+    material_candidate_metrics = image_metrics(
+        target_linear_np, material_candidate_render, material_loss_mask_np
+    )
     material_selection = "optimized"
     if (
         material_candidate_metrics["display_mse"]
@@ -1261,21 +1891,53 @@ def main() -> None:
         for key, value in best_materials.items():
             params[key] = mi.TensorXf(value)
         params.update()
-        final_render = material_initial_render
-    final_metrics = image_metrics(target_linear_np, final_render)
-    save_linear_image(mi, output_dir / "material_selected_combined", final_render)
+        selected_validation_render = material_initial_render
+    else:
+        selected_validation_render = material_candidate_render
+    selected_validation_metrics = image_metrics(
+        target_linear_np,
+        selected_validation_render,
+        material_loss_mask_np,
+    )
+    save_linear_image(
+        mi, output_dir / "material_selected_combined", selected_validation_render
+    )
     material_outputs = save_material_outputs(
         mi, output_dir, best_materials, material_arrays
     )
-    final_render_path = output_dir / "best_results" / "rendered_img.exr"
-    mi.util.write_bitmap(str(final_render_path), final_render)
+    final_seed = args.seed + 500000
+    final_render = render_validation_mean(
+        mi,
+        dr,
+        scene,
+        params,
+        spp=args.final_spp,
+        seeds=[final_seed],
+    )
+    final_render_outputs = save_final_render_variants(
+        mi,
+        best_dir=output_dir / "best_results",
+        rendered_raw=final_render,
+        denoise=not args.no_denoise,
+    )
+    final_metrics = image_metrics(
+        target_linear_np,
+        final_render,
+        material_loss_mask_np,
+    )
     final_metrics_report = {
+        "validation_spp": args.validation_spp,
+        "validation_seeds": material_validation_seeds,
+        "final_spp": args.final_spp,
+        "final_seed": final_seed,
         "initial": material_initial_metrics,
         "candidate": material_candidate_metrics,
-        "selected": final_metrics,
+        "selected_validation": selected_validation_metrics,
+        "final_raw": final_metrics,
         "selection": material_selection,
         "display_mse_delta": (
-            final_metrics["display_mse"] - material_initial_metrics["display_mse"]
+            selected_validation_metrics["display_mse"]
+            - material_initial_metrics["display_mse"]
         ),
     }
     write_json(output_dir / "final_metrics.json", final_metrics_report)
@@ -1286,7 +1948,7 @@ def main() -> None:
     )
 
     manifest = {
-        "schema_version": 5,
+        "schema_version": 6,
         "status": "complete",
         "stage_b_enabled": False,
         "model_name": args.model_name,
@@ -1305,17 +1967,43 @@ def main() -> None:
         # Retained for compatibility with manifests from lamp-only runs.
         "fixed_lamp_radiance_scale": args.radiance_scale,
         "geometry_scale": light_set.metadata["geometry_scale"],
+        "normal_source": "mesh" if args.use_mesh_normal else "moge2_normal_map",
+        "use_mesh_normal": args.use_mesh_normal,
+        "window_bsdf": "null",
         "input_materials": {key: str(value) for key, value in material_paths.items()},
+        "optimization": {
+            "integrator": args.integrator,
+            "max_depth": args.max_depth,
+            "spp": args.spp,
+            "spp_grad": args.spp_grad,
+            "resample_each_iteration": args.resample_each_iteration,
+            "display_loss": "clipped_linear_to_standard_srgb",
+            "validation_spp_per_seed": args.validation_spp,
+            "validation_seed_count": args.validation_seeds,
+            "validation_interval": args.validation_interval,
+            "validation_min_delta": args.validation_min_delta,
+            "validation_patience": args.validation_patience,
+            "final_spp": args.final_spp,
+            "final_seed": final_seed,
+            "direct_optimizer": {
+                "type": "adam",
+                "amsgrad": True,
+                "mask_updates": True,
+            },
+            "pos_mlp_weight_decay": 0.0,
+        },
+        "loss_masks": loss_mask_metadata,
         "farfield": {
             "width": args.farfield_width,
             "height": args.farfield_height,
             "iterations": args.farfield_iters,
             "best_loss": farfield_best_loss,
             "best_checkpoint_value": farfield_best_loss,
-            "checkpoint_metric": args.farfield_checkpoint_metric,
+            "checkpoint_metric": "validation_display_mse",
             "selection": farfield_selection,
-            "validation_spp": args.preview_spp,
+            "validation_spp": args.validation_spp,
             "validation_seed": farfield_validation_seed,
+            "validation_seeds": farfield_validation_seeds,
             "initial_display_mse": farfield_initial_metrics["display_mse"],
             "candidate_display_mse": farfield_candidate_metrics["display_mse"],
             "selected_display_mse": farfield_metrics["display_mse"],
@@ -1343,9 +2031,16 @@ def main() -> None:
             "patience": args.material_patience,
             "min_delta": args.material_min_delta,
             "outputs": material_outputs,
-            "rendered_img": str(final_render_path),
+            "validation_spp": args.validation_spp,
+            "validation_seed": material_validation_seed,
+            "validation_seeds": material_validation_seeds,
+            "final_spp": args.final_spp,
+            "final_seed": final_seed,
+            "renders": final_render_outputs,
+            "rendered_img": final_render_outputs["rendered_img_exr"],
             "selection": material_selection,
             "metrics": final_metrics,
+            "validation_metrics": selected_validation_metrics,
         },
         "farfield_metrics": farfield_metrics,
         "farfield_candidate_metrics": farfield_candidate_metrics,

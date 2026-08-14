@@ -1,7 +1,7 @@
 # Materialist
 ## [Project Page](https://lez-s.github.io/materialist_project/) | [Paper (arXiv)](https://arxiv.org/abs/2501.03717) | [Paper (IJCV)](https://link.springer.com/article/10.1007/s11263-026-02833-z)
 ![teaser](assets/teaser.png)
-Materialist is an inverse rendering framework for material estimation and editing from single images. It leverages differentiable rendering techniques to accurately recover physically-based materials and lighting conditions from photographs.
+Materialist is an inverse rendering framework for material estimation and editing from single images. It leverages differentiable rendering techniques to accurately recover physically-based materials and lighting conditions from photographs. The current research branch also provides an optional FLUX.2 post-processing stage that converts a completed PBR render into a photograph-like visualization while retaining the rendered scene, illumination, and color appearance.
 
 # Features
 
@@ -10,13 +10,14 @@ Materialist is an inverse rendering framework for material estimation and editin
 - Environment map estimation
 - Material editing capabilities
 - Specialized rendering for transparent and translucent materials
+- Optional PBR-render-to-photo refinement using aligned color and normal references
 
 ⚠️ Note: transparency editing in this repository is an approximation. The edited light paths do NOT truly pass through the object, so refraction can be inaccurate under strong or weak illumination and for geometrically complex objects.
 
 
 # Usage
 
-## 1. Installation andExternal Dependencies
+## 1. Installation and External Dependencies
 
 - Mitsuba
 - PyTorch 
@@ -27,6 +28,16 @@ Materialist requires Python 3.10 and CUDA-compatible GPU hardware. Install depen
 
 ```bash
 pip install -r requirements.txt
+```
+
+The optional FLUX.2 photo-refinement entry additionally requires recent
+Diffusers packages. In the project's `materialist5090` environment, install
+them with:
+
+```bash
+/home/majortom/miniconda3/envs/materialist5090/bin/pip install \
+  "diffusers>=0.39.0,<0.40" "transformers>=4.51,<6" \
+  "accelerate>=0.31.0" "safetensors>=0.8.0"
 ```
 
 
@@ -103,15 +114,94 @@ Gaussian lobes, instead of being reduced to a uniform RGB rectangle.
   --farfield-iters 300 \
   --material-iters 500 \
   --material-order rm a \
-  --model_name none
+  --model_name pos_mlp \
+  --integrator prb --max-depth 4 \
+  --spp 16 --spp-grad 16 \
+  --validation-spp 64 --validation-seeds 2 \
+  --final-spp 256
 ```
 
 This entry skips per-light Stage B refinement: all ILE lamps and window lobes
 remain fixed, Stage C optimizes the low-resolution far-field HDRI, and Stage D
 freezes all lighting while optimizing roughness/metallic followed by albedo.
-Use `--model_name pos_mlp` for the PosMLP parameterization. See
+It uses the MoGe2 normal map by default (`--use-mesh-normal` is the opt-in
+ablation), an explicit null BSDF for transparent window apertures, PRB with
+`max_depth=4`, clipped standard-sRGB losses, and masks that exclude visible
+emitters and depth/mesh edges. Fixed multi-seed validation selects checkpoints
+and controls early stopping. The final 256-SPP raw render is kept separate from
+the optional OptiX preview. Use `--model_name none` for direct pixel/tensor
+optimization. See
 [`hybrid_light/README.md`](hybrid_light/README.md) for the complete data model,
 rendering semantics, outputs, and validation notes.
+
+### 3.2.2 FLUX.2 PBR-to-photo refinement
+
+`flux2_opt.py` is an optional final visualization stage built on
+[FLUX.2 Klein Base 4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B).
+It does not re-estimate the PBR scene. Instead, it restores photographic
+material detail and mild camera realism after Mitsuba rendering. The PBR color
+image remains the authoritative reference for composition, objects, lighting,
+shadows, brightness, and color appearance.
+
+The current default Example1 ILE2 inputs are:
+
+- PBR color render:
+  `output_imgs/indoorlight_example1_ile2/best_results/rendered_img_hq.exr`
+- Aligned signed normal map:
+  `output_imgs/indoorlight_example1_ile2/best_results/normal.exr`
+- Local model directory:
+  `/home/majortom/project/datasets/ckpt/FLUX.2-klein-base-4B`
+
+The inference logic is:
+
+1. Read the linear HDR PBR render, clean invalid values, compute automatic
+   exposure, apply ACES tone mapping, and convert it to a 1024×768 sRGB color
+   reference.
+2. Read the pixel-aligned normal EXR independently. Signed `[-1, 1]` and
+   unsigned `[0, 1]` encodings are supported; normals are re-normalized and
+   encoded as an RGB normal-map reference without tone mapping.
+3. Pass the PBR color reference first and the normal reference second to the
+   Klein multi-reference editing pipeline. The normal reference uses a smaller
+   512×384 default size so geometry helps preserve boundaries without
+   dominating the PBR appearance.
+4. Use a compact prompt that asks only for realistic textures, roughness,
+   surface variation, edges, contact detail, and mild camera realism. Lighting
+   and overall color feeling are explicitly kept unchanged.
+5. Save the photograph, both processed references, and a JSON record containing
+   paths, prompt, seed, exposure, normal decoding, model versions, and runtime.
+
+The model has already been placed in the default checkpoint directory. Run the
+complete offline inference with:
+
+```bash
+/home/majortom/miniconda3/envs/materialist5090/bin/python \
+  /home/majortom/project/Materialist/flux2_opt.py --offline
+```
+
+Useful overrides include:
+
+- `--input` / `--normal`: choose another aligned PBR render and normal map.
+- `--output`: choose the final PNG/JPEG path.
+- `--normal-encoding {auto,signed,unsigned}`: control normal decoding.
+- `--long-edge`: primary color/output resolution, 1024 by default.
+- `--normal-long-edge`: auxiliary normal resolution, 512 by default; lowering
+  it weakens normal-map influence.
+- `--steps`, `--guidance-scale`, and `--seed`: sampling controls; defaults are
+  50, 4.0, and 2026 for the undistilled Base checkpoint.
+- `--memory-mode {auto,cuda,offload}`: keep the model on CUDA when memory allows
+  or use Accelerate CPU offload.
+- `--download-only`: download/check the Diffusers model without inference.
+
+With the default output stem, the script writes:
+
+- `flux2_photoreal_with_normal.png`: final 1024×768 photograph-like image.
+- `flux2_photoreal_with_normal_render_reference.png`: processed PBR reference.
+- `flux2_photoreal_with_normal_normal_reference.png`: decoded normal reference.
+- `flux2_photoreal_with_normal.json`: reproducibility metadata.
+
+The generated photograph is an AI-refined, display-referred image. Keep the
+original linear EXR as the authoritative output for relighting, inverse-rendering
+metrics, radiometric comparisons, and material evaluation.
 
 
 
@@ -141,6 +231,7 @@ Results are saved to the `output_imgs/{save_name}/` directory, including:
 - Environment maps
 - Rendered images (PNG and HDR/EXR formats)
 - Reconstructed mesh (.ply)
+- Optional FLUX.2 photo-real output, processed references, and inference JSON
 
 # Citation
 ```

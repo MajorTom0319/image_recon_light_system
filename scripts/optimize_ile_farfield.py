@@ -415,6 +415,8 @@ def optimize_farfield(
     params,
     target_srgb,
     args,
+    loss_mask=None,
+    validation_fn=None,
 ) -> tuple[np.ndarray, list[dict[str, Any]], float]:
     """Optimize only the low-resolution far-field envmap; lamps stay frozen."""
     env_key = "far_field_env.data"
@@ -431,13 +433,30 @@ def optimize_farfield(
             f"{sorted(expected_shapes)}"
         )
 
-    optimizer = mi.ad.Adam(lr=args.farfield_lr)
+    optimizer = mi.ad.Adam(
+        lr=args.farfield_lr,
+        amsgrad=True,
+        mask_updates=True,
+    )
     optimizer[env_key] = params[env_key]
     params.update(optimizer)
 
     history: list[dict[str, Any]] = []
     best_loss = float("inf")
     best_env: np.ndarray | None = None
+    validation_reference: float | None = None
+    stale_validations = 0
+    if validation_fn is not None:
+        best_loss = validation_fn()
+        validation_reference = best_loss
+        best_env = np.asarray(params[env_key], dtype=np.float32).copy()
+
+    def masked_mean(value):
+        if loss_mask is None:
+            return dr.mean(value)
+        return dr.sum(value * loss_mask.array) / dr.maximum(
+            dr.sum(loss_mask.array), 1e-8
+        )
 
     for iteration in range(args.farfield_iters):
         learning_rate = cosine_learning_rate(iteration, args.farfield_iters, args.farfield_lr)
@@ -452,15 +471,15 @@ def optimize_farfield(
             seed=seed,
             seed_grad=seed + 1,
         )
+        if getattr(args, "clip_display", False):
+            rendered_linear = dr.clip(rendered_linear, 0.0, 1.0)
         rendered_srgb = linear_to_srgb_dr(dr, rendered_linear)
         difference = rendered_srgb.array - target_srgb.array
-        loss_charbonnier = charbonnier_loss_dr(
-            dr,
-            rendered_srgb,
-            target_srgb,
-            args.charbonnier_epsilon,
+        loss_charbonnier = masked_mean(
+            dr.sqrt(dr.square(difference) + args.charbonnier_epsilon**2)
+            - args.charbonnier_epsilon
         )
-        loss_mse = dr.mean(dr.square(difference))
+        loss_mse = masked_mean(dr.square(difference))
         loss_tv, loss_energy = farfield_regularizers(
             mi,
             dr,
@@ -491,7 +510,7 @@ def optimize_farfield(
         checkpoint_value = (
             float(loss_mse[0]) if checkpoint_metric_name == "mse" else loss_value
         )
-        if checkpoint_value < best_loss:
+        if validation_fn is None and checkpoint_value < best_loss:
             best_loss = checkpoint_value
             best_env = np.asarray(optimizer[env_key], dtype=np.float32).copy()
 
@@ -507,13 +526,47 @@ def optimize_farfield(
         )
         params.update(optimizer)
 
+        validation_mse = None
+        should_validate = (
+            validation_fn is not None
+            and (
+                (iteration + 1) % args.validation_interval == 0
+                or iteration == args.farfield_iters - 1
+            )
+        )
+        if should_validate:
+            validation_mse = validation_fn()
+            history[-1]["validation_mse"] = validation_mse
+            if validation_mse < best_loss:
+                best_loss = validation_mse
+                best_env = np.asarray(
+                    optimizer[env_key], dtype=np.float32
+                ).copy()
+            if validation_mse < validation_reference * (
+                1.0 - args.validation_min_delta
+            ):
+                validation_reference = validation_mse
+                stale_validations = 0
+            else:
+                stale_validations += 1
+
         if iteration % args.log_interval == 0 or iteration == args.farfield_iters - 1:
             print(
                 f"[Far-field {iteration:04d}/{args.farfield_iters}] "
                 f"loss={loss_value:.6f} charb={float(loss_charbonnier[0]):.6f} "
                 f"mse={float(loss_mse[0]):.6f} tv={float(loss_tv[0]):.6f} "
-                f"energy={float(loss_energy[0]):.6f}"
+                f"energy={float(loss_energy[0]):.6f} "
+                f"val={validation_mse if validation_mse is not None else '-'}"
             )
+        if (
+            validation_fn is not None
+            and stale_validations >= args.validation_patience
+        ):
+            print(
+                f"[Far-field] early stopping at {iteration}: "
+                "validation did not improve"
+            )
+            break
 
     if best_env is None:
         raise RuntimeError("Far-field optimization did not produce a valid checkpoint")

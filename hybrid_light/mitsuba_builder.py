@@ -50,7 +50,9 @@ def build_sensor_dict(mi, camera_meta: dict[str, Any]) -> dict[str, Any]:
 
 def _light_transform(mi, light: MeshAreaLight, visible_offset: float):
     scale = mi.ScalarTransform4f.scale([light.geometry_scale] * 3)
-    if not light.visible or visible_offset == 0:
+    # ``visible_offset`` is only a coplanarity workaround for visible lamps.
+    # Moving a window changes its physical aperture and breaks wall alignment.
+    if light.is_window or not light.visible or visible_offset == 0:
         return scale
     center = light.scaled_center
     distance = float(np.linalg.norm(center))
