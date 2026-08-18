@@ -475,12 +475,82 @@ def render_validation_mean(
     return np.mean(np.stack(renders, axis=0), axis=0, dtype=np.float32)
 
 
+def prepare_optix_denoiser_guides(
+    albedo: np.ndarray,
+    normals_world: np.ndarray,
+    camera_meta: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare linear albedo and sensor-space normals for OptiX denoising."""
+    albedo = np.asarray(albedo, dtype=np.float32)[..., :3]
+    normals_world = np.asarray(normals_world, dtype=np.float32)[..., :3]
+    if albedo.shape != normals_world.shape or albedo.ndim != 3:
+        raise ValueError(
+            "OptiX guide shapes must match as HxWx3: "
+            f"albedo={albedo.shape}, normals={normals_world.shape}"
+        )
+
+    to_world = np.asarray(camera_meta["to_world"], dtype=np.float32)
+    while to_world.ndim > 2:
+        to_world = to_world[0]
+    if to_world.shape != (4, 4):
+        raise ValueError(f"Expected camera to_world 4x4, got {to_world.shape}")
+    world_to_sensor = np.linalg.inv(to_world)[:3, :3]
+
+    albedo = np.nan_to_num(albedo, nan=0.0, posinf=1.0, neginf=0.0)
+    albedo = np.clip(albedo, 0.0, 1.0)
+    normals_sensor = np.einsum(
+        "ij,...j->...i", world_to_sensor, normals_world
+    ).astype(np.float32)
+    normals_sensor = np.nan_to_num(normals_sensor, nan=0.0, posinf=0.0, neginf=0.0)
+    normal_length = np.linalg.norm(normals_sensor, axis=-1, keepdims=True)
+    invalid = normal_length[..., 0] <= 1e-8
+    normals_sensor /= np.maximum(normal_length, 1e-8)
+    normals_sensor[invalid] = (0.0, 0.0, 1.0)
+    return (
+        np.ascontiguousarray(albedo, dtype=np.float32),
+        np.ascontiguousarray(normals_sensor, dtype=np.float32),
+    )
+
+
+def _guided_optix_denoise(
+    mi,
+    rendered_raw: np.ndarray,
+    albedo: np.ndarray,
+    normals_sensor: np.ndarray,
+) -> np.ndarray:
+    rendered_raw = np.ascontiguousarray(rendered_raw, dtype=np.float32)
+    albedo = np.ascontiguousarray(albedo, dtype=np.float32)
+    normals_sensor = np.ascontiguousarray(normals_sensor, dtype=np.float32)
+    if albedo.shape != rendered_raw.shape or normals_sensor.shape != rendered_raw.shape:
+        raise ValueError(
+            "OptiX radiance/albedo/normal inputs must have the same shape: "
+            f"radiance={rendered_raw.shape}, albedo={albedo.shape}, "
+            f"normals={normals_sensor.shape}"
+        )
+    denoiser = mi.OptixDenoiser(
+        input_size=(int(rendered_raw.shape[1]), int(rendered_raw.shape[0])),
+        albedo=True,
+        normals=True,
+        temporal=False,
+    )
+    return np.asarray(
+        denoiser(
+            mi.TensorXf(rendered_raw),
+            mi.TensorXf(albedo),
+            mi.TensorXf(normals_sensor),
+        ),
+        dtype=np.float32,
+    )
+
+
 def save_render_variants(
     mi,
     *,
     base_path: Path,
     rendered_raw: np.ndarray,
     denoise: bool,
+    denoise_albedo: np.ndarray,
+    denoise_normals: np.ndarray,
 ) -> tuple[np.ndarray, dict[str, str]]:
     raw_base = base_path.with_name(base_path.name + "_raw")
     save_linear_image(mi, raw_base, rendered_raw)
@@ -490,15 +560,11 @@ def save_render_variants(
         "raw_png": str(raw_base.with_suffix(".png")),
     }
     if denoise:
-        denoiser = mi.OptixDenoiser(
-            input_size=(int(rendered_raw.shape[1]), int(rendered_raw.shape[0])),
-            albedo=False,
-            normals=False,
-            temporal=False,
-        )
-        displayed = np.asarray(
-            denoiser(mi.TensorXf(np.asarray(rendered_raw, dtype=np.float32))),
-            dtype=np.float32,
+        displayed = _guided_optix_denoise(
+            mi,
+            rendered_raw,
+            denoise_albedo,
+            denoise_normals,
         )
         outputs.update(
             {
@@ -516,6 +582,8 @@ def save_final_render_variants(
     best_dir: Path,
     rendered_raw: np.ndarray,
     denoise: bool,
+    denoise_albedo: np.ndarray,
+    denoise_normals: np.ndarray,
 ) -> dict[str, str]:
     """Keep the authoritative final result raw; denoise only a named preview."""
     compatibility_base = best_dir / "rendered_img"
@@ -529,15 +597,11 @@ def save_final_render_variants(
         "final_raw_png": str(raw_base.with_suffix(".png")),
     }
     if denoise:
-        denoiser = mi.OptixDenoiser(
-            input_size=(int(rendered_raw.shape[1]), int(rendered_raw.shape[0])),
-            albedo=False,
-            normals=False,
-            temporal=False,
-        )
-        denoised = np.asarray(
-            denoiser(mi.TensorXf(np.asarray(rendered_raw, dtype=np.float32))),
-            dtype=np.float32,
+        denoised = _guided_optix_denoise(
+            mi,
+            rendered_raw,
+            denoise_albedo,
+            denoise_normals,
         )
         denoised_base = best_dir / "rendered_img_final_denoised"
         save_linear_image(mi, denoised_base, denoised)
@@ -1518,7 +1582,7 @@ def main() -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else materialist_dir / "hybrid_ile_windows_farfield_material_opt_none_posmlp_default_512_814"
+        else materialist_dir / "hybrid_ile_windows_farfield_material_opt_none_posmlp_8_17"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1561,7 +1625,11 @@ def main() -> None:
     target_srgb_np = linear_to_display_srgb_np(target_linear_np)
     target_srgb = mi.TensorXf(target_srgb_np)
     save_linear_image(mi, output_dir / "target", target_linear_np)
-    farfield_loss_mask_np, material_loss_mask_np, loss_mask_metadata = (
+    (
+        diagnostic_farfield_mask_np,
+        diagnostic_material_mask_np,
+        diagnostic_mask_metadata,
+    ) = (
         build_loss_masks(
             mi,
             materialist_dir=materialist_dir,
@@ -1572,18 +1640,40 @@ def main() -> None:
             depth_edge_rtol=args.depth_edge_rtol,
         )
     )
-    farfield_loss_mask = mi.TensorXf(farfield_loss_mask_np)
-    material_loss_mask = mi.TensorXf(material_loss_mask_np)
+    # Keep the former exclusion masks only as diagnostics. No spatial loss mask
+    # is passed to either optimizer, validation gate, or final metric: every
+    # target pixel now participates in both Stage C and Stage D.
+    farfield_loss_mask_np = None
+    material_loss_mask_np = None
+    farfield_loss_mask = None
+    material_loss_mask = None
+    full_image_mask = np.ones((height, width), dtype=np.uint8) * 255
     for name, value in (
-        ("farfield_loss_mask.png", farfield_loss_mask_np[..., 0]),
-        ("material_loss_mask.png", material_loss_mask_np[..., 0]),
+        ("farfield_exclusion_diagnostic_mask.png", diagnostic_farfield_mask_np[..., 0]),
+        ("material_exclusion_diagnostic_mask.png", diagnostic_material_mask_np[..., 0]),
     ):
         cv2.imwrite(str(output_dir / name), (value * 255.0 + 0.5).astype(np.uint8))
-    loss_mask_metadata.update(
-        {
-            "farfield_mask": str(output_dir / "farfield_loss_mask.png"),
-            "material_mask": str(output_dir / "material_loss_mask.png"),
-        }
+    cv2.imwrite(str(output_dir / "farfield_loss_mask.png"), full_image_mask)
+    cv2.imwrite(str(output_dir / "material_loss_mask.png"), full_image_mask)
+    loss_mask_metadata = {
+        "mode": "full_image",
+        "spatial_loss_mask_enabled": False,
+        "farfield_valid_fraction": 1.0,
+        "material_valid_fraction": 1.0,
+        "farfield_mask": str(output_dir / "farfield_loss_mask.png"),
+        "material_mask": str(output_dir / "material_loss_mask.png"),
+        "diagnostic_previous_exclusion": {
+            **diagnostic_mask_metadata,
+            "farfield_mask": str(
+                output_dir / "farfield_exclusion_diagnostic_mask.png"
+            ),
+            "material_mask": str(
+                output_dir / "material_exclusion_diagnostic_mask.png"
+            ),
+        },
+    }
+    initial_denoise_albedo, denoise_normals_sensor = prepare_optix_denoiser_guides(
+        material_arrays["a"], material_arrays["n"], camera_meta
     )
     # The current target is display-referred LDR stored in linear EXR form.
     # Keep the shared far-field optimizer backward compatible and opt in here.
@@ -1636,6 +1726,8 @@ def main() -> None:
         base_path=output_dir / "farfield_initial_combined",
         rendered_raw=farfield_initial_render,
         denoise=not args.no_denoise,
+        denoise_albedo=initial_denoise_albedo,
+        denoise_normals=denoise_normals_sensor,
     )
 
     def validate_farfield_checkpoint() -> float:
@@ -1681,6 +1773,8 @@ def main() -> None:
         base_path=output_dir / "farfield_candidate_combined",
         rendered_raw=farfield_render,
         denoise=not args.no_denoise,
+        denoise_albedo=initial_denoise_albedo,
+        denoise_normals=denoise_normals_sensor,
     )
     farfield_initial_metrics = image_metrics(
         target_linear_np, farfield_initial_render, farfield_loss_mask_np
@@ -1812,6 +1906,8 @@ def main() -> None:
         base_path=output_dir / "material_initial_combined",
         rendered_raw=material_initial_render,
         denoise=not args.no_denoise,
+        denoise_albedo=initial_denoise_albedo,
+        denoise_normals=denoise_normals_sensor,
     )
 
     def validate_material_checkpoint() -> float:
@@ -1859,6 +1955,8 @@ def main() -> None:
         base_path=output_dir / "material_optimized_combined",
         rendered_raw=material_candidate_render,
         denoise=not args.no_denoise,
+        denoise_albedo=np.asarray(params[MATERIAL_KEYS["a"]], dtype=np.float32),
+        denoise_normals=denoise_normals_sensor,
     )
     farfield_after_material = np.asarray(params[env_key], dtype=np.float32)
     farfield_frozen_max_abs_diff = float(
@@ -1919,6 +2017,8 @@ def main() -> None:
         best_dir=output_dir / "best_results",
         rendered_raw=final_render,
         denoise=not args.no_denoise,
+        denoise_albedo=np.asarray(params[MATERIAL_KEYS["a"]], dtype=np.float32),
+        denoise_normals=denoise_normals_sensor,
     )
     final_metrics = image_metrics(
         target_linear_np,
@@ -1985,6 +2085,7 @@ def main() -> None:
             "validation_patience": args.validation_patience,
             "final_spp": args.final_spp,
             "final_seed": final_seed,
+            "spatial_loss_scope": "full_image",
             "direct_optimizer": {
                 "type": "adam",
                 "amsgrad": True,
@@ -1993,6 +2094,14 @@ def main() -> None:
             "pos_mlp_weight_decay": 0.0,
         },
         "loss_masks": loss_mask_metadata,
+        "denoiser": {
+            "type": "optix",
+            "enabled": not args.no_denoise,
+            "albedo_guide": True,
+            "normal_guide": True,
+            "normal_source": "moge2_normal_map",
+            "normal_space": "sensor",
+        },
         "farfield": {
             "width": args.farfield_width,
             "height": args.farfield_height,

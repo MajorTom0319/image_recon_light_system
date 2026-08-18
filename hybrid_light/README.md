@@ -104,9 +104,9 @@ Materialist ARM maps:
   --material-order rm a \
   --model_name pos_mlp \
   --integrator prb --max-depth 4 \
-  --spp 16 --spp-grad 16 \
+  --spp 64 --spp-grad 64 \
   --validation-spp 64 --validation-seeds 2 \
-  --final-spp 256
+  --final-spp 512
 ```
 
 `--model_name none` retains the original direct per-pixel optimization. To use
