@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--model_name",
         "--model-name",
         choices=("none", "pos_mlp"),
-        default="none",
+        default="pos_mlp",
         help="Optimization parameterization: direct pixels or Materialist PosMLP",
     )
 
@@ -131,6 +131,42 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="L1 weight to the input maps, equivalent to scale_delta",
+    )
+    parser.add_argument(
+        "--posmlp-train-seeds",
+        type=int,
+        default=2,
+        help="Independent Monte Carlo renders averaged per PosMLP training step",
+    )
+    parser.add_argument(
+        "--posmlp-material-tv-weight",
+        type=float,
+        default=1e-2,
+        help="TV weight on PosMLP material changes from their input maps",
+    )
+    parser.add_argument(
+        "--posmlp-hidden-depth",
+        type=int,
+        default=4,
+        help="Number of hidden layers in the far-field and material PosMLPs, for nerf it's 8",
+    )
+    parser.add_argument(
+        "--posmlp-hidden-width",
+        type=int,
+        default=256,
+        help="Hidden width of the far-field and material PosMLPs",
+    )
+    parser.add_argument(
+        "--posmlp-multires",
+        type=int,
+        default=3,
+        help="Number of Fourier frequency bands used by both PosMLPs",
+    )
+    parser.add_argument(
+        "--posmlp-backbone",
+        choices=("pos_mlp", "nerf_mlp"),
+        default="pos_mlp",
+        help="Coordinate-network backbone; nerf_mlp uses ReLU and a layer-4 skip",
     )
     exposure_group = parser.add_mutually_exclusive_group()
     exposure_group.add_argument(
@@ -231,6 +267,10 @@ def parse_args() -> argparse.Namespace:
         "material_lr",
         "material_lr_step",
         "material_patience",
+        "posmlp_train_seeds",
+        "posmlp_hidden_depth",
+        "posmlp_hidden_width",
+        "posmlp_multires",
         "spp",
         "spp_grad",
         "validation_spp",
@@ -249,6 +289,7 @@ def parse_args() -> argparse.Namespace:
         "farfield_tv_weight",
         "farfield_energy_weight",
         "material_prior_weight",
+        "posmlp_material_tv_weight",
         "charbonnier_weight",
         "mse_weight",
         "visible_offset",
@@ -268,6 +309,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--material-lr-gamma must be in (0, 1]")
     if args.material_min_delta is not None and args.material_min_delta < 0:
         parser.error("--material-min-delta must be non-negative")
+    if args.posmlp_hidden_depth < 3:
+        parser.error("--posmlp-hidden-depth must be at least 3")
+    if args.posmlp_hidden_width <= 32:
+        parser.error("--posmlp-hidden-width must be greater than 32")
+    if args.posmlp_backbone == "nerf_mlp" and args.posmlp_hidden_depth < 6:
+        parser.error("nerf_mlp requires --posmlp-hidden-depth of at least 6")
 
     # optimize_farfield() uses this only to keep random seeds disjoint from
     # Stage B. There is intentionally no Stage B in this experiment.
@@ -299,6 +346,15 @@ def linear_to_display_srgb_np(value: np.ndarray) -> np.ndarray:
 
 def linear_to_display_srgb_dr(dr, value):
     return linear_to_srgb_dr(dr, dr.clip(value, 0.0, 1.0))
+
+
+def linear_to_optimization_srgb_np(value: np.ndarray) -> np.ndarray:
+    """Extended sRGB for optimization; preserve gradients above linear 1."""
+    return linear_to_srgb_np(np.maximum(np.asarray(value, dtype=np.float32), 0.0))
+
+
+def linear_to_optimization_srgb_dr(dr, value):
+    return linear_to_srgb_dr(dr, dr.maximum(value, 0.0))
 
 
 def _masked_mean_np(value: np.ndarray, mask: np.ndarray | None) -> float:
@@ -445,14 +501,14 @@ def build_loss_masks(
     )
 
 
-def _display_mse_np(
+def _optimization_mse_np(
     target_linear: np.ndarray,
     rendered_linear: np.ndarray,
     loss_mask: np.ndarray | None,
 ) -> float:
     difference = (
-        linear_to_display_srgb_np(rendered_linear)
-        - linear_to_display_srgb_np(target_linear)
+        linear_to_optimization_srgb_np(rendered_linear)
+        - linear_to_optimization_srgb_np(target_linear)
     )
     return _masked_mean_np(np.square(difference), loss_mask)
 
@@ -657,15 +713,30 @@ def image_metrics(
     rendered_linear: np.ndarray,
     loss_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Metrics matching the display-space optimization objective."""
-    target = linear_to_display_srgb_np(target_linear)
-    rendered = linear_to_display_srgb_np(rendered_linear)
-    difference = rendered - target
-    mse = _masked_mean_np(np.square(difference), loss_mask)
+    """Report display metrics separately from the HDR-aware optimization metric."""
+    target_display = linear_to_display_srgb_np(target_linear)
+    rendered_display = linear_to_display_srgb_np(rendered_linear)
+    display_difference = rendered_display - target_display
+    display_mse = _masked_mean_np(np.square(display_difference), loss_mask)
+    optimization_difference = (
+        linear_to_optimization_srgb_np(rendered_linear)
+        - linear_to_optimization_srgb_np(target_linear)
+    )
+    optimization_mse = _masked_mean_np(
+        np.square(optimization_difference), loss_mask
+    )
     return {
-        "display_mae": _masked_mean_np(np.abs(difference), loss_mask),
-        "display_mse": mse,
-        "display_psnr": float("inf") if mse == 0 else float(-10.0 * np.log10(mse)),
+        "optimization_mae": _masked_mean_np(
+            np.abs(optimization_difference), loss_mask
+        ),
+        "optimization_mse": optimization_mse,
+        "display_mae": _masked_mean_np(np.abs(display_difference), loss_mask),
+        "display_mse": display_mse,
+        "display_psnr": (
+            float("inf")
+            if display_mse == 0
+            else float(-10.0 * np.log10(display_mse))
+        ),
         "linear_mae": _masked_mean_np(
             np.abs(rendered_linear - target_linear), loss_mask
         ),
@@ -674,8 +745,8 @@ def image_metrics(
         ),
         "target_linear_mean": float(np.mean(target_linear)),
         "render_linear_mean": float(np.mean(rendered_linear)),
-        "target_display_mean": float(np.mean(target)),
-        "render_display_mean": float(np.mean(rendered)),
+        "target_display_mean": float(np.mean(target_display)),
+        "render_display_mean": float(np.mean(rendered_display)),
         "render_linear_max": float(np.max(rendered_linear)),
     }
 
@@ -689,9 +760,9 @@ def select_validated_farfield(
     candidate_render: np.ndarray,
     candidate_metrics: dict[str, float],
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float], str]:
-    """Keep the Stage-C candidate only when same-seed validation improves MSE."""
-    initial_mse = float(initial_metrics["display_mse"])
-    candidate_mse = float(candidate_metrics["display_mse"])
+    """Keep the candidate only when HDR-aware same-seed validation improves."""
+    initial_mse = float(initial_metrics["optimization_mse"])
+    candidate_mse = float(candidate_metrics["optimization_mse"])
     if not np.isfinite(initial_mse):
         raise ValueError("Initial Stage-C validation MSE must be finite")
     if np.isfinite(candidate_mse) and candidate_mse <= initial_mse:
@@ -828,7 +899,7 @@ def optimize_materials(
                 )
                 exposure_ratio = target_mean / rendered_mean
             rendered_matched = rendered_linear * exposure_ratio
-            rendered_srgb = linear_to_display_srgb_dr(dr, rendered_matched)
+            rendered_srgb = linear_to_optimization_srgb_dr(dr, rendered_matched)
             difference = rendered_srgb.array - target_srgb.array
             loss_mse = _masked_mean_dr(dr, dr.square(difference), loss_mask)
             loss_l1 = _masked_mean_dr(dr, dr.abs(difference), loss_mask)
@@ -978,7 +1049,7 @@ def optimize_materials(
                 "phase": phase,
                 "channels": list(channels),
                 "iterations": len(history) - phase_start,
-                "best_display_mse": best_mse,
+                "best_optimization_mse": best_mse,
                 "min_delta": phase_min_delta,
                 "frozen_channels": list(frozen_channels),
                 "frozen_max_abs_diff": frozen_max_abs_diff,
@@ -989,7 +1060,7 @@ def optimize_materials(
 
 
 def _torch_linear_to_srgb(torch, value):
-    value = torch.clamp(value, 0.0, 1.0)
+    value = torch.clamp_min(value, 0.0)
     return torch.where(
         value <= 0.0031308,
         12.92 * value,
@@ -1001,6 +1072,15 @@ def _torch_masked_mean(torch, value, loss_mask):
     if loss_mask is None:
         return torch.mean(value)
     return torch.sum(value * loss_mask) / torch.clamp_min(torch.sum(loss_mask), 1e-8)
+
+
+def _torch_spatial_total_variation(torch, value):
+    terms = []
+    if value.shape[0] > 1:
+        terms.append(torch.mean(torch.abs(value[1:] - value[:-1])))
+    if value.shape[1] > 1:
+        terms.append(torch.mean(torch.abs(value[:, 1:] - value[:, :-1])))
+    return sum(terms, torch.zeros((), dtype=value.dtype, device=value.device))
 
 
 def optimize_farfield_pos_mlp(
@@ -1016,7 +1096,7 @@ def optimize_farfield_pos_mlp(
 ) -> tuple[np.ndarray, list[dict[str, Any]], float]:
     """PosMLP parameterization of the existing Stage-C objective."""
     import torch
-    from mymodels.mlps import PosMLP
+    from mymodels.mlps import NeRFMLP, PosMLP
 
     if not torch.cuda.is_available():
         raise RuntimeError("--model_name pos_mlp requires CUDA")
@@ -1037,13 +1117,15 @@ def optimize_farfield_pos_mlp(
         dtype=torch.float32,
         device=device,
     )
-    envmap_net = PosMLP(
+    network_class = NeRFMLP if args.posmlp_backbone == "nerf_mlp" else PosMLP
+    skip_connection = [4] if args.posmlp_backbone == "nerf_mlp" else [1, 3]
+    envmap_net = network_class(
         in_dims=6,
         out_dims=3,
-        dims=[256] * 4,
-        skip_connection=[1, 3],
+        dims=[args.posmlp_hidden_width] * args.posmlp_hidden_depth,
+        skip_connection=skip_connection,
         weight_norm=False,
-        multires_view=2,
+        multires_view=args.posmlp_multires,
         output_type="envmap",
         color_ch=3,
         img_h=args.farfield_height,
@@ -1052,7 +1134,7 @@ def optimize_farfield_pos_mlp(
     ).to(device)
     # PosMLP's zero-initialized head otherwise starts at softplus(0)=0.693.
     # Match the direct branch's --farfield-init without changing the network.
-    output_layer = getattr(envmap_net, f"lin{envmap_net.num_layers - 2}")
+    output_layer = envmap_net.output_layer
     initial_bias = float(np.log(np.expm1(max(args.farfield_init, 1e-6))))
     with torch.no_grad():
         output_layer.bias.fill_(initial_bias)
@@ -1110,9 +1192,18 @@ def optimize_farfield_pos_mlp(
             else logical_env
         )
         iteration_seed = iteration if args.resample_each_iteration else 0
-        seed = args.seed + (args.stage_b_iters + iteration_seed) * 2
+        seed = args.seed + (
+            args.stage_b_iters + iteration_seed
+        ) * 2 * args.posmlp_train_seeds
+        rendered_linear = torch.stack(
+            [
+                render_envmap(storage_env, seed + sample_index * 2)
+                for sample_index in range(args.posmlp_train_seeds)
+            ],
+            dim=0,
+        ).mean(dim=0)
         rendered_srgb = _torch_linear_to_srgb(
-            torch, render_envmap(storage_env, seed)
+            torch, rendered_linear
         )
         difference = rendered_srgb - target
         loss_charbonnier = _torch_masked_mean(
@@ -1241,7 +1332,7 @@ def optimize_materials_pos_mlp(
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], list[dict[str, Any]]]:
     """PosMLP parameterization of the existing sequential material phases."""
     import torch
-    from mymodels.mlps import PosMLP
+    from mymodels.mlps import NeRFMLP, PosMLP
 
     if not torch.cuda.is_available():
         raise RuntimeError("--model_name pos_mlp requires CUDA")
@@ -1297,18 +1388,22 @@ def optimize_materials_pos_mlp(
             base_arm.reshape(-1, 5), dtype=torch.float32, device=device
         )
         torch.manual_seed(args.seed + phase_index + 1)
-        brdf_net = PosMLP(
+        network_class = NeRFMLP if args.posmlp_backbone == "nerf_mlp" else PosMLP
+        skip_connection = [4] if args.posmlp_backbone == "nerf_mlp" else [1, 3]
+        brdf_net = network_class(
             in_dims=7,
             out_dims=5,
-            dims=[256] * 4,
-            skip_connection=[1, 3],
+            dims=[args.posmlp_hidden_width] * args.posmlp_hidden_depth,
+            skip_connection=skip_connection,
             weight_norm=False,
-            multires_view=2,
+            multires_view=args.posmlp_multires,
             output_type="arm",
             color_ch=5,
             img_h=current["a"].shape[0],
             img_w=current["a"].shape[1],
             coordinate_type="uv",
+            normalize_uv=True,
+            use_ste_clamp=False,
         ).to(device)
         optimizer = torch.optim.AdamW(
             brdf_net.parameters(),
@@ -1363,10 +1458,21 @@ def optimize_materials_pos_mlp(
             }
             iteration_seed = iteration if args.resample_each_iteration else 0
             seed_offset = phase_index * args.material_iters + iteration_seed
-            seed = args.seed + (args.farfield_iters + seed_offset) * 2
-            rendered_linear = render_materials(
-                materials["a"], materials["r"], materials["m"], seed
-            )
+            seed = args.seed + (
+                args.farfield_iters + seed_offset
+            ) * 2 * args.posmlp_train_seeds
+            rendered_linear = torch.stack(
+                [
+                    render_materials(
+                        materials["a"],
+                        materials["r"],
+                        materials["m"],
+                        seed + sample_index * 2,
+                    )
+                    for sample_index in range(args.posmlp_train_seeds)
+                ],
+                dim=0,
+            ).mean(dim=0)
             exposure_ratio = 1.0
             if args.material_exposure_match:
                 exposure_ratio = target_mean / max(
@@ -1382,16 +1488,27 @@ def optimize_materials_pos_mlp(
             loss_l1 = _torch_masked_mean(
                 torch, torch.abs(difference), loss_mask_torch
             )
-            loss_balance = loss_l1.detach() / torch.clamp_min(
-                loss_mse.detach(), 1e-8
-            )
-            loss_render = 3.0 * loss_balance * loss_mse + loss_l1
+            # loss_balance = loss_l1.detach() / torch.clamp_min(
+            #     loss_mse.detach(), 1e-8
+            # )
+            loss_render = loss_mse + loss_l1
             prior_values = {
                 channel: torch.mean(torch.abs(materials[channel] - initial[channel]))
                 for channel in channels
             }
             loss_prior = sum(prior_values.values(), torch.zeros((), device=device))
-            loss = loss_render + args.material_prior_weight * loss_prior
+            tv_values = {
+                channel: _torch_spatial_total_variation(
+                    torch, materials[channel] - initial[channel]
+                )
+                for channel in channels
+            }
+            loss_tv = sum(tv_values.values(), torch.zeros((), device=device))
+            loss = (
+                loss_render
+                + args.material_prior_weight * loss_prior
+                + args.posmlp_material_tv_weight * loss_tv
+            )
             loss_value = float(loss.detach())
             mse_value = float(loss_mse.detach())
             history.append(
@@ -1405,11 +1522,16 @@ def optimize_materials_pos_mlp(
                     "mse": mse_value,
                     "l1": float(loss_l1.detach()),
                     "prior": float(loss_prior.detach()),
+                    "material_delta_tv": float(loss_tv.detach()),
                     "exposure_ratio": float(exposure_ratio),
                     "learning_rate": float(learning_rate),
                     "channel_priors": {
                         channel: float(value.detach())
                         for channel, value in prior_values.items()
+                    },
+                    "channel_delta_tv": {
+                        channel: float(value.detach())
+                        for channel, value in tv_values.items()
                     },
                 }
             )
@@ -1488,6 +1610,7 @@ def optimize_materials_pos_mlp(
                     f"loss={loss_value:.6f} render={float(loss_render.detach()):.6f} "
                     f"mse={mse_value:.6f} l1={float(loss_l1.detach()):.6f} "
                     f"prior={float(loss_prior.detach()):.6f} "
+                    f"tv={float(loss_tv.detach()):.6f} "
                     f"exposure={float(exposure_ratio):.4f} "
                     f"val={validation_mse if validation_mse is not None else '-'}"
                 )
@@ -1531,7 +1654,7 @@ def optimize_materials_pos_mlp(
                 "phase": phase,
                 "channels": list(channels),
                 "iterations": len(history) - phase_start,
-                "best_display_mse": best_mse,
+                "best_optimization_mse": best_mse,
                 "min_delta": phase_min_delta,
                 "frozen_channels": list(frozen_channels),
                 "frozen_max_abs_diff": frozen_max_abs_diff,
@@ -1582,7 +1705,7 @@ def main() -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else materialist_dir / "hybrid_ile_windows_farfield_material_opt_none_posmlp_8_17"
+        else materialist_dir / "hybrid_ile_win_farfield_material_opt_nerf_mlp_d8m3"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1622,7 +1745,7 @@ def main() -> None:
     target_path, target_source = resolve_target_path(args, light_set, materialist_dir)
     target_linear_np = load_target_linear(mi, target_path, (height, width))
     target_linear = mi.TensorXf(target_linear_np)
-    target_srgb_np = linear_to_display_srgb_np(target_linear_np)
+    target_srgb_np = linear_to_optimization_srgb_np(target_linear_np)
     target_srgb = mi.TensorXf(target_srgb_np)
     save_linear_image(mi, output_dir / "target", target_linear_np)
     (
@@ -1675,10 +1798,6 @@ def main() -> None:
     initial_denoise_albedo, denoise_normals_sensor = prepare_optix_denoiser_guides(
         material_arrays["a"], material_arrays["n"], camera_meta
     )
-    # The current target is display-referred LDR stored in linear EXR form.
-    # Keep the shared far-field optimizer backward compatible and opt in here.
-    args.clip_display = True
-
     # Stage C: fixed ILE lamps and fixed input materials; optimize only HDRI.
     farfield_initial = np.full(
         (args.farfield_height, args.farfield_width, 3),
@@ -1729,6 +1848,50 @@ def main() -> None:
         denoise_albedo=initial_denoise_albedo,
         denoise_normals=denoise_normals_sensor,
     )
+    for output_name, initial_lights in (
+        (
+            "farfield_initial_lambs_combined",
+            [light for light in light_set.lights if not light.is_window],
+        ),
+        (
+            "farfield_initial_windows_combined",
+            [light for light in light_set.lights if light.is_window],
+        ),
+    ):
+        initial_scene_dict = build_hybrid_scene_dict(
+            mi,
+            mesh_path=mesh_path,
+            camera_meta_path=camera_path,
+            camera_meta=camera_meta,
+            lights=initial_lights,
+            mode="combined",
+            envmap_path=farfield_initial_path,
+            radiance_scale=args.radiance_scale,
+            visible_offset=args.visible_offset,
+            use_mesh_normal=args.use_mesh_normal,
+            max_depth=args.max_depth,
+        )
+        initial_scene_dict["integrator"]["type"] = args.integrator
+        initial_scene = mi.load_dict(initial_scene_dict)
+        initial_params = mi.traverse(initial_scene)
+        set_material_parameters(mi, initial_params, material_arrays)
+        initial_render = render_validation_mean(
+            mi,
+            dr,
+            initial_scene,
+            initial_params,
+            spp=args.validation_spp,
+            seeds=farfield_validation_seeds,
+        )
+        save_render_variants(
+            mi,
+            base_path=output_dir / output_name,
+            rendered_raw=initial_render,
+            denoise=not args.no_denoise,
+            denoise_albedo=initial_denoise_albedo,
+            denoise_normals=denoise_normals_sensor,
+        )
+        del initial_params, initial_scene
 
     def validate_farfield_checkpoint() -> float:
         rendered = render_validation_mean(
@@ -1739,7 +1902,7 @@ def main() -> None:
             spp=args.validation_spp,
             seeds=farfield_validation_seeds,
         )
-        return _display_mse_np(
+        return _optimization_mse_np(
             target_linear_np,
             rendered,
             farfield_loss_mask_np,
@@ -1777,10 +1940,14 @@ def main() -> None:
         denoise_normals=denoise_normals_sensor,
     )
     farfield_initial_metrics = image_metrics(
-        target_linear_np, farfield_initial_render, farfield_loss_mask_np
+        target_linear_np,
+        farfield_initial_render,
+        farfield_loss_mask_np
     )
     farfield_candidate_metrics = image_metrics(
-        target_linear_np, farfield_render, farfield_loss_mask_np
+        target_linear_np,
+        farfield_render,
+        farfield_loss_mask_np
     )
     (
         selected_farfield,
@@ -1838,6 +2005,14 @@ def main() -> None:
             "selection": farfield_selection,
             # Retained for readers of the previous metrics schema.
             "optimized": farfield_metrics,
+            "candidate_optimization_mse_delta": (
+                farfield_candidate_metrics["optimization_mse"]
+                - farfield_initial_metrics["optimization_mse"]
+            ),
+            "optimization_mse_delta": (
+                farfield_metrics["optimization_mse"]
+                - farfield_initial_metrics["optimization_mse"]
+            ),
             "candidate_display_mse_delta": (
                 farfield_candidate_metrics["display_mse"]
                 - farfield_initial_metrics["display_mse"]
@@ -1919,7 +2094,7 @@ def main() -> None:
             spp=args.validation_spp,
             seeds=material_validation_seeds,
         )
-        return _display_mse_np(
+        return _optimization_mse_np(
             target_linear_np,
             rendered,
             material_loss_mask_np,
@@ -1970,15 +2145,19 @@ def main() -> None:
     write_json(output_dir / "material_history.json", material_history)
     write_json(output_dir / "material_phase_summaries.json", material_phase_summaries)
     material_initial_metrics = image_metrics(
-        target_linear_np, material_initial_render, material_loss_mask_np
+        target_linear_np,
+        material_initial_render,
+        material_loss_mask_np
     )
     material_candidate_metrics = image_metrics(
-        target_linear_np, material_candidate_render, material_loss_mask_np
+        target_linear_np,
+        material_candidate_render,
+        material_loss_mask_np,
     )
     material_selection = "optimized"
     if (
-        material_candidate_metrics["display_mse"]
-        > material_initial_metrics["display_mse"]
+        material_candidate_metrics["optimization_mse"]
+        > material_initial_metrics["optimization_mse"]
     ):
         material_selection = "initial_validation_fallback"
         optimized_channels = list(dict.fromkeys("".join(args.material_order)))
@@ -2035,6 +2214,10 @@ def main() -> None:
         "selected_validation": selected_validation_metrics,
         "final_raw": final_metrics,
         "selection": material_selection,
+        "optimization_mse_delta": (
+            selected_validation_metrics["optimization_mse"]
+            - material_initial_metrics["optimization_mse"]
+        ),
         "display_mse_delta": (
             selected_validation_metrics["display_mse"]
             - material_initial_metrics["display_mse"]
@@ -2048,7 +2231,7 @@ def main() -> None:
     )
 
     manifest = {
-        "schema_version": 6,
+        "schema_version": 7,
         "status": "complete",
         "stage_b_enabled": False,
         "model_name": args.model_name,
@@ -2077,7 +2260,9 @@ def main() -> None:
             "spp": args.spp,
             "spp_grad": args.spp_grad,
             "resample_each_iteration": args.resample_each_iteration,
-            "display_loss": "clipped_linear_to_standard_srgb",
+            "render_loss": "extended_standard_srgb",
+            "checkpoint_metric": "optimization_mse",
+            "display_metrics_clipped": True,
             "validation_spp_per_seed": args.validation_spp,
             "validation_seed_count": args.validation_seeds,
             "validation_interval": args.validation_interval,
@@ -2091,6 +2276,16 @@ def main() -> None:
                 "amsgrad": True,
                 "mask_updates": True,
             },
+            "pos_mlp_train_seeds": args.posmlp_train_seeds,
+            "pos_mlp_backbone": args.posmlp_backbone,
+            "pos_mlp_hidden_depth": args.posmlp_hidden_depth,
+            "pos_mlp_hidden_width": args.posmlp_hidden_width,
+            "pos_mlp_multires": args.posmlp_multires,
+            "pos_mlp_material_uv_normalized": True,
+            "pos_mlp_material_uv_frequency_scale": "pi",
+            "pos_mlp_material_ste_clamp": False,
+            "pos_mlp_material_bound": "sigmoid_logit_residual",
+            "pos_mlp_material_delta_tv_weight": args.posmlp_material_tv_weight,
             "pos_mlp_weight_decay": 0.0,
         },
         "loss_masks": loss_mask_metadata,
@@ -2108,7 +2303,7 @@ def main() -> None:
             "iterations": args.farfield_iters,
             "best_loss": farfield_best_loss,
             "best_checkpoint_value": farfield_best_loss,
-            "checkpoint_metric": "validation_display_mse",
+            "checkpoint_metric": "validation_optimization_mse",
             "selection": farfield_selection,
             "validation_spp": args.validation_spp,
             "validation_seed": farfield_validation_seed,
@@ -2116,6 +2311,15 @@ def main() -> None:
             "initial_display_mse": farfield_initial_metrics["display_mse"],
             "candidate_display_mse": farfield_candidate_metrics["display_mse"],
             "selected_display_mse": farfield_metrics["display_mse"],
+            "initial_optimization_mse": farfield_initial_metrics[
+                "optimization_mse"
+            ],
+            "candidate_optimization_mse": farfield_candidate_metrics[
+                "optimization_mse"
+            ],
+            "selected_optimization_mse": farfield_metrics[
+                "optimization_mse"
+            ],
             "optimized_exr": str(farfield_exr),
             "optimized_hdr": str(farfield_hdr),
             "preview_png": str(farfield_preview),
@@ -2129,8 +2333,8 @@ def main() -> None:
             "iterations_per_phase": args.material_iters,
             "completed_iterations": len(material_history),
             "phase_summaries": material_phase_summaries,
-            "final_phase_best_display_mse": material_phase_summaries[-1][
-                "best_display_mse"
+            "final_phase_best_optimization_mse": material_phase_summaries[-1][
+                "best_optimization_mse"
             ],
             "prior_weight": args.material_prior_weight,
             "exposure_match": args.material_exposure_match,
